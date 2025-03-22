@@ -1,11 +1,13 @@
+use futures::Stream;
 use std::collections::HashMap;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
-use tokio::sync::{mpsc, oneshot, Notify};
+use tokio::sync::{Notify, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
-use futures::{Stream, stream};
 
 /// Represents either a determinate progress value or indeterminate state
 #[derive(Debug, Clone, Copy)]
@@ -97,9 +99,7 @@ impl ProgressNode {
 
         let child = Arc::new(child);
 
-        parent_inner
-            .children
-            .push((child.clone(), weight));
+        parent_inner.children.push((child.clone(), weight));
 
         child
     }
@@ -390,33 +390,10 @@ impl Drop for ProgressSubscription {
     }
 }
 
-impl ProgressSubscription {
-    /// Get the next update from the subscription
-    pub async fn next(&mut self) -> Option<ProgressUpdate> {
-        self.rx.recv().await
-    }
+impl Stream for ProgressSubscription {
+    type Item = ProgressUpdate;
 
-    /// Convert the subscription into a stream of updates
-    pub fn into_stream(self) -> impl Stream<Item = ProgressUpdate> {
-        stream::unfold(self, |mut sub| async move {
-            sub.next().await.map(|update| (update, sub))
-        })
-    }
-
-    /// Try to get the next update without waiting
-    pub fn try_next(&mut self) -> Option<ProgressUpdate> {
-        self.rx.try_recv().ok()
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        Pin::new(&mut self.rx).poll_recv(cx)
     }
 }
-
-// /// Subscribe to progress updates from a token
-// pub async fn subscribe(
-//     token: &ProgressToken,
-// ) -> (Uuid, tokio::sync::mpsc::Receiver<ProgressUpdate>) {
-//     token.node.subscribe().await
-// }
-
-// /// Unsubscribe from progress updates
-// pub fn unsubscribe(token: &ProgressToken, id: Uuid) {
-//     token.node.unsubscribe(id);
-// }
