@@ -8,6 +8,7 @@ tokio = { version = "1.44", features = ["sync"] }
 tokio-util = "0.7.14"
 uuid = { version = "1.16.0", features = ["v4"] }
 futures = { version = "0.3", features = ["std"] }
+pin-project-lite = "0.2.16"
 
 [dev-dependencies]
 tokio = { version = "1.44", features = ["sync", "time", "macros", "rt-multi-thread"] }

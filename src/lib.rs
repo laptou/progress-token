@@ -1,4 +1,5 @@
-use futures::Stream;
+use futures::{ready, Stream};
+use pin_project_lite::pin_project;
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -6,21 +7,21 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 use tokio::sync::{Notify, mpsc, oneshot};
-use tokio_util::sync::CancellationToken;
+use tokio_util::sync::{CancellationToken, WaitForCancellationFuture};
 use uuid::Uuid;
 
 /// Represents either a determinate progress value or indeterminate state
 #[derive(Debug, Clone, Copy)]
-pub enum ProgressState {
+pub enum Progress {
     Determinate(f64),
     Indeterminate,
 }
 
-impl ProgressState {
+impl Progress {
     fn as_f64(&self) -> Option<f64> {
         match self {
-            ProgressState::Determinate(v) => Some(*v),
-            ProgressState::Indeterminate => None,
+            Progress::Determinate(v) => Some(*v),
+            Progress::Indeterminate => None,
         }
     }
 }
@@ -28,8 +29,7 @@ impl ProgressState {
 /// Data for a progress update event
 #[derive(Debug, Clone)]
 pub struct ProgressUpdate {
-    // pub token_id: Uuid,
-    pub progress: ProgressState,
+    pub progress: Progress,
     pub path: Vec<String>,
     pub is_cancelled: bool,
 }
@@ -48,7 +48,7 @@ struct ProgressNodeInner {
     children: Vec<(Arc<ProgressNode>, f64)>, // Node and its weight
 
     // Progress state
-    progress: ProgressState,
+    progress: Progress,
     status: String,
     is_completed: bool,
 
@@ -74,7 +74,7 @@ impl ProgressNode {
                 parent: None,
                 parent_idx: 0,
                 children: Vec::new(),
-                progress: ProgressState::Determinate(0.0),
+                progress: Progress::Determinate(0.0),
                 status,
                 is_completed: false,
                 handle_count: 1,
@@ -93,7 +93,7 @@ impl ProgressNode {
                 parent: Some(parent.clone()),
                 parent_idx: parent_inner.children.len(),
                 children: Vec::new(),
-                progress: ProgressState::Determinate(0.0),
+                progress: Progress::Determinate(0.0),
                 status,
                 is_completed: false,
                 handle_count: 1,
@@ -109,12 +109,12 @@ impl ProgressNode {
         child
     }
 
-    fn calculate_progress(node: &Arc<Self>) -> ProgressState {
+    fn calculate_progress(node: &Arc<Self>) -> Progress {
         let inner = node.inner.lock().unwrap();
 
         // If this node itself is indeterminate, propagate that
-        if matches!(inner.progress, ProgressState::Indeterminate) {
-            return ProgressState::Indeterminate;
+        if matches!(inner.progress, Progress::Indeterminate) {
+            return Progress::Indeterminate;
         }
 
         if inner.children.is_empty() {
@@ -132,12 +132,12 @@ impl ProgressNode {
             .any(|(child, _)| {
                 matches!(
                     Self::calculate_progress(child),
-                    ProgressState::Indeterminate
+                    Progress::Indeterminate
                 )
             });
 
         if has_indeterminate {
-            return ProgressState::Indeterminate;
+            return Progress::Indeterminate;
         }
 
         // Calculate weighted average of determinate children
@@ -146,13 +146,13 @@ impl ProgressNode {
             .iter()
             .map(|(child, weight)| {
                 match Self::calculate_progress(child) {
-                    ProgressState::Determinate(p) => p * weight,
-                    ProgressState::Indeterminate => 0.0, // Shouldn't happen due to check above
+                    Progress::Determinate(p) => p * weight,
+                    Progress::Indeterminate => 0.0, // Shouldn't happen due to check above
                 }
             })
             .sum();
 
-        ProgressState::Determinate(total)
+        Progress::Determinate(total)
     }
 
     fn get_status_hierarchy(node: &Arc<Self>) -> Vec<String> {
@@ -198,6 +198,8 @@ impl ProgressNode {
             inner.subscribers.clone()
         };
 
+        
+
         for (_, sender) in &subscribers {
             let _ = sender.try_send(update.clone());
         }
@@ -214,34 +216,6 @@ impl ProgressNode {
         if let Some(parent) = parent {
             Self::notify_subscribers(&parent, false);
         }
-    }
-
-    fn subscribe(&self) -> (Uuid, mpsc::Receiver<ProgressUpdate>) {
-        let (tx, rx) = mpsc::channel(16);
-        let id = Uuid::new_v4();
-
-        // Get initial state while holding the lock
-        let initial_update = {
-            let mut inner = self.inner.lock().unwrap();
-            inner.subscribers.insert(id, tx.clone());
-            ProgressUpdate {
-                // token_id: self.id,
-                progress: inner.progress,
-                // status: inner.status.clone(),
-                path: vec![inner.status.clone()],
-                is_cancelled: false,
-            }
-        };
-
-        // Send initial update without holding the lock
-        let _ = tx.try_send(initial_update);
-
-        (id, rx)
-    }
-
-    fn unsubscribe(&self, id: Uuid) {
-        let mut inner = self.inner.lock().unwrap();
-        inner.subscribers.remove(&id);
     }
 }
 
@@ -296,7 +270,7 @@ impl ProgressToken {
 
         // if now.duration_since(self.last_update) > Duration::from_millis(100) || count % 10 == 0 {
         let mut inner = self.node.inner.lock().unwrap();
-        inner.progress = ProgressState::Determinate(progress.max(0.0).min(1.0));
+        inner.progress = Progress::Determinate(progress.max(0.0).min(1.0));
         drop(inner);
 
         ProgressNode::notify_subscribers(&self.node, false);
@@ -310,7 +284,7 @@ impl ProgressToken {
         }
 
         let mut inner = self.node.inner.lock().unwrap();
-        inner.progress = ProgressState::Indeterminate;
+        inner.progress = Progress::Indeterminate;
         drop(inner);
 
         ProgressNode::notify_subscribers(&self.node, false);
@@ -334,7 +308,7 @@ impl ProgressToken {
         if self.is_active.swap(false, Ordering::Relaxed) {
             let mut inner = self.node.inner.lock().unwrap();
             inner.is_completed = true;
-            inner.progress = ProgressState::Determinate(1.0);
+            inner.progress = Progress::Determinate(1.0);
             drop(inner);
 
             ProgressNode::notify_subscribers(&self.node, false);
@@ -350,9 +324,12 @@ impl ProgressToken {
         }
     }
 
-    /// Get a handle to the cancellation token
-    pub fn cancellation_token(&self) -> CancellationToken {
-        self.cancel_token.clone()
+    pub fn cancelled(&self) -> WaitForCancellationFuture {
+        self.cancel_token.cancelled()
+    }
+
+    pub fn updated(&self) -> WaitForUpdateFuture {
+
     }
 
     /// Check if this token has been cancelled
@@ -360,25 +337,41 @@ impl ProgressToken {
         self.cancel_token.is_cancelled()
     }
 
-    /// Get the current progress value asynchronously
-    pub async fn value(&self) -> ProgressState {
+    /// Get the current progress state asynchronously
+    pub fn state(&self) -> Progress {
         ProgressNode::calculate_progress(&self.node)
     }
 
     /// Get all status messages in this hierarchy asynchronously
-    pub async fn statuses(&self) -> Vec<String> {
+    pub fn statuses(&self) -> Vec<String> {
         ProgressNode::get_status_hierarchy(&self.node)
     }
+}
 
-    /// Subscribe to progress updates from this token
-    /// Returns a subscription that will automatically unsubscribe when dropped
-    pub fn subscribe(&self) -> ProgressSubscription {
-        let (id, rx) = self.node.subscribe();
-        ProgressSubscription {
-            token: self.node.clone(),
-            id,
-            rx,
+
+pin_project! {
+    /// A Future that is resolved once the corresponding [`ProgressToken`]
+    /// is updated. Resolves to `None` if the progress token is cancelled.
+    #[must_use = "futures do nothing unless polled"]
+    pub struct WaitForUpdateFuture<'a> {
+        token: &'a ProgressToken,
+        #[pin]
+        future: tokio::sync::futures::Notified<'a>,
+    }
+}
+
+impl<'a> Future for WaitForUpdateFuture<'a> {
+    type Output = Option<ProgressUpdate>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let mut this = self.project();
+        if this.token.is_cancelled() {
+            return Poll::Ready(None);
         }
+
+        ready!(this.future.as_mut().poll(cx));
+
+        Poll::Ready(Some(this.token.state()))
     }
 }
 
@@ -424,23 +417,23 @@ mod tests {
         let token = ProgressToken::new("test");
         token.progress(0.5);
         assert!(
-            matches!(token.value().await, ProgressState::Determinate(p) if (p - 0.5).abs() < f64::EPSILON)
+            matches!(token.state().await, Progress::Determinate(p) if (p - 0.5).abs() < f64::EPSILON)
         );
 
         token.progress(1.0);
         assert!(
-            matches!(token.value().await, ProgressState::Determinate(p) if (p - 1.0).abs() < f64::EPSILON)
+            matches!(token.state().await, Progress::Determinate(p) if (p - 1.0).abs() < f64::EPSILON)
         );
 
         // test progress clamping
         token.progress(1.5);
         assert!(
-            matches!(token.value().await, ProgressState::Determinate(p) if (p - 1.0).abs() < f64::EPSILON)
+            matches!(token.state().await, Progress::Determinate(p) if (p - 1.0).abs() < f64::EPSILON)
         );
 
         token.progress(-0.5);
         assert!(
-            matches!(token.value().await, ProgressState::Determinate(p) if p.abs() < f64::EPSILON)
+            matches!(token.state().await, Progress::Determinate(p) if p.abs() < f64::EPSILON)
         );
     }
 
@@ -454,13 +447,13 @@ mod tests {
 
         // root progress should be weighted average: 0.5 * 0.6 + 0.5 * 0.4 = 0.5
         assert!(
-            matches!(root.value().await, ProgressState::Determinate(p) if (p - 0.5).abs() < f64::EPSILON)
+            matches!(root.state().await, Progress::Determinate(p) if (p - 0.5).abs() < f64::EPSILON)
         );
 
         child1.progress(1.0);
         // root progress should now be: 1.0 * 0.6 + 0.5 * 0.4 = 0.8
         assert!(
-            matches!(root.value().await, ProgressState::Determinate(p) if (p - 0.8).abs() < f64::EPSILON)
+            matches!(root.state().await, Progress::Determinate(p) if (p - 0.8).abs() < f64::EPSILON)
         );
     }
 
@@ -473,11 +466,11 @@ mod tests {
         child2.progress(0.5);
 
         // root should be indeterminate
-        assert!(matches!(root.value().await, ProgressState::Indeterminate));
+        assert!(matches!(root.state().await, Progress::Indeterminate));
 
         // set child back to determinate
         child1.progress(0.5);
-        assert!(matches!(root.value().await, ProgressState::Determinate(_)));
+        assert!(matches!(root.state().await, Progress::Determinate(_)));
     }
 
     #[tokio::test]
@@ -517,7 +510,7 @@ mod tests {
         // updates should not be processed after cancellation
         child1.progress(0.5);
         assert!(
-            matches!(child1.value().await, ProgressState::Determinate(p) if p.abs() < f64::EPSILON)
+            matches!(child1.state().await, Progress::Determinate(p) if p.abs() < f64::EPSILON)
         );
     }
 
@@ -527,13 +520,13 @@ mod tests {
         token.complete();
 
         assert!(
-            matches!(token.value().await, ProgressState::Determinate(p) if (p - 1.0).abs() < f64::EPSILON)
+            matches!(token.state().await, Progress::Determinate(p) if (p - 1.0).abs() < f64::EPSILON)
         );
 
         // updates after completion should not be processed
         token.progress(0.5);
         assert!(
-            matches!(token.value().await, ProgressState::Determinate(p) if (p - 1.0).abs() < f64::EPSILON)
+            matches!(token.state().await, Progress::Determinate(p) if (p - 1.0).abs() < f64::EPSILON)
         );
     }
 
@@ -545,13 +538,13 @@ mod tests {
         // initial update
         let update = subscription.next().await.unwrap();
         assert_eq!(update.status(), "test");
-        assert!(matches!(update.progress, ProgressState::Determinate(p) if p.abs() < f64::EPSILON));
+        assert!(matches!(update.progress, Progress::Determinate(p) if p.abs() < f64::EPSILON));
 
         // progress update
         token.progress(0.5);
         let update = subscription.next().await.unwrap();
         assert!(
-            matches!(update.progress, ProgressState::Determinate(p) if (p - 0.5).abs() < f64::EPSILON)
+            matches!(update.progress, Progress::Determinate(p) if (p - 0.5).abs() < f64::EPSILON)
         );
     }
 
@@ -568,11 +561,11 @@ mod tests {
         let update2 = sub2.next().await.unwrap();
 
         assert!(
-            matches!(update1.progress, ProgressState::Determinate(p) if (p - 0.5).abs() < f64::EPSILON),
+            matches!(update1.progress, Progress::Determinate(p) if (p - 0.5).abs() < f64::EPSILON),
             "{update1:?}"
         );
         assert!(
-            matches!(update2.progress, ProgressState::Determinate(p) if (p - 0.5).abs() < f64::EPSILON),
+            matches!(update2.progress, Progress::Determinate(p) if (p - 0.5).abs() < f64::EPSILON),
             "{update2:?}"
         );
     }
@@ -598,7 +591,7 @@ mod tests {
 
         // final progress should be from the last update (0.9)
         assert!(
-            matches!(token.value().await, ProgressState::Determinate(p) if (p - 0.9).abs() < f64::EPSILON)
+            matches!(token.state().await, Progress::Determinate(p) if (p - 0.9).abs() < f64::EPSILON)
         );
     }
 
@@ -608,7 +601,7 @@ mod tests {
         let token = ProgressToken::new("single");
         token.progress(0.5);
         assert!(
-            matches!(token.value().await, ProgressState::Determinate(p) if (p - 0.5).abs() < f64::EPSILON)
+            matches!(token.state().await, Progress::Determinate(p) if (p - 0.5).abs() < f64::EPSILON)
         );
 
         // deep hierarchy
@@ -621,7 +614,7 @@ mod tests {
         current.progress(1.0);
         // progress should propagate to root
         assert!(
-            matches!(current.value().await, ProgressState::Determinate(p) if (p - 1.0).abs() < f64::EPSILON)
+            matches!(current.state().await, Progress::Determinate(p) if (p - 1.0).abs() < f64::EPSILON)
         );
     }
 }
