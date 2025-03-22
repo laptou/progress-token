@@ -1,12 +1,11 @@
 use futures::{Stream, ready};
 use pin_project_lite::pin_project;
-use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
-use std::time::{Duration, Instant};
-use tokio::sync::{Notify, broadcast, oneshot};
+use std::time::Instant;
+use tokio::sync::{Notify, broadcast};
 use tokio_stream::wrappers::BroadcastStream;
 use tokio_util::sync::{CancellationToken, WaitForCancellationFuture};
 
@@ -69,7 +68,7 @@ impl<S: Clone + Send> ProgressNode<S> {
     fn new(status: S) -> Self {
         // create broadcast channel with reasonable buffer size
         let (tx, _) = broadcast::channel(16);
-        
+
         Self {
             inner: Mutex::new(ProgressNodeInner {
                 parent: None,
@@ -87,7 +86,7 @@ impl<S: Clone + Send> ProgressNode<S> {
 
     fn child(parent: &Arc<Self>, weight: f64, status: S) -> Arc<Self> {
         let mut parent_inner = parent.inner.lock().unwrap();
-        
+
         // create broadcast channel with reasonable buffer size
         let (tx, _) = broadcast::channel(16);
 
@@ -350,9 +349,9 @@ impl<S: Clone + Send + 'static> ProgressToken<S> {
             is_cancelled: false,
         };
 
-        ProgressStream { 
-            token: self, 
-            rx: BroadcastStream::new(rx)
+        ProgressStream {
+            token: self,
+            rx: BroadcastStream::new(rx),
         }
     }
 }
@@ -401,7 +400,10 @@ impl<'a, S: Clone + Send + 'static> Stream for ProgressStream<'a, S> {
     type Item = ProgressUpdate<S>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        self.project().rx.poll_next(cx).map(|opt| opt.map(|res| res.unwrap()))
+        self.project()
+            .rx
+            .poll_next(cx)
+            .map(|opt| opt.map(|res| res.unwrap()))
     }
 }
 
