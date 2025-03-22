@@ -17,12 +17,19 @@ pub enum Progress {
 }
 
 impl Progress {
-    fn as_f64(&self) -> Option<f64> {
+    pub fn as_f64(&self) -> Option<f64> {
         match self {
             Progress::Determinate(v) => Some(*v),
             Progress::Indeterminate => None,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum ProgressError {
+    /// Too many progress updates have occurred since last polled, so some of
+    /// them have been dropped
+    Lagged,
 }
 
 /// Data for a progress update event
@@ -43,16 +50,12 @@ impl<S> ProgressUpdate<S> {
 struct ProgressNodeInner<S> {
     // Tree structure
     parent: Option<Arc<ProgressNode<S>>>,
-    parent_idx: usize,
     children: Vec<(Arc<ProgressNode<S>>, f64)>, // Node and its weight
 
     // Progress state
     progress: Progress,
     status: S,
     is_completed: bool,
-
-    // Handle tracking
-    handle_count: usize,
 
     // Subscriber management
     update_sender: broadcast::Sender<ProgressUpdate<S>>,
@@ -61,7 +64,7 @@ struct ProgressNodeInner<S> {
 /// A node in the progress tree
 struct ProgressNode<S> {
     inner: Mutex<ProgressNodeInner<S>>,
-    change_notify: Notify,
+    // change_notify: Notify,
 }
 
 impl<S: Clone + Send> ProgressNode<S> {
@@ -72,15 +75,13 @@ impl<S: Clone + Send> ProgressNode<S> {
         Self {
             inner: Mutex::new(ProgressNodeInner {
                 parent: None,
-                parent_idx: 0,
                 children: Vec::new(),
                 progress: Progress::Determinate(0.0),
                 status,
                 is_completed: false,
-                handle_count: 1,
                 update_sender: tx,
             }),
-            change_notify: Notify::new(),
+            // change_notify: Notify::new(),
         }
     }
 
@@ -93,15 +94,13 @@ impl<S: Clone + Send> ProgressNode<S> {
         let child = Self {
             inner: Mutex::new(ProgressNodeInner {
                 parent: Some(parent.clone()),
-                parent_idx: parent_inner.children.len(),
                 children: Vec::new(),
                 progress: Progress::Determinate(0.0),
                 status,
                 is_completed: false,
-                handle_count: 1,
                 update_sender: tx,
             }),
-            change_notify: Notify::new(),
+            // change_notify: Notify::new(),
         };
 
         let child = Arc::new(child);
@@ -192,7 +191,7 @@ impl<S: Clone + Send> ProgressNode<S> {
         };
 
         // Notify waiters
-        node.change_notify.notify_waiters();
+        // node.change_notify.notify_waiters();
 
         // Propagate to parent
         let parent = {
@@ -210,8 +209,6 @@ impl<S: Clone + Send> ProgressNode<S> {
 #[derive(Clone)]
 pub struct ProgressToken<S> {
     node: Arc<ProgressNode<S>>,
-    update_count: Arc<AtomicU64>,
-    last_update: Instant,
     is_active: Arc<AtomicBool>,
     cancel_token: CancellationToken,
 }
@@ -223,8 +220,6 @@ impl<S: Clone + Send + 'static> ProgressToken<S> {
 
         Arc::new(Self {
             node,
-            update_count: Arc::new(AtomicU64::new(0)),
-            last_update: Instant::now(),
             is_active: Arc::new(AtomicBool::new(true)),
             cancel_token: CancellationToken::new(),
         })
@@ -236,8 +231,6 @@ impl<S: Clone + Send + 'static> ProgressToken<S> {
 
         Arc::new(Self {
             node,
-            update_count: Arc::new(AtomicU64::new(0)),
-            last_update: Instant::now(),
             is_active: Arc::new(AtomicBool::new(true)),
             cancel_token: parent.cancel_token.child_token(),
         })
@@ -328,10 +321,23 @@ impl<S: Clone + Send + 'static> ProgressToken<S> {
         self.cancel_token.cancelled()
     }
 
-    pub fn updated(&self) -> WaitForUpdateFuture<S> {
-        WaitForUpdateFuture {
-            token: self,
-            future: self.node.change_notify.notified(),
+    pub async fn updated(&self) -> Option<ProgressUpdate<S>> {
+        let mut rx = {
+            let inner = self.node.inner.lock().unwrap();
+            inner.update_sender.subscribe()
+        };
+
+        tokio::select! {
+            _ = self.cancel_token.cancelled() => {
+                None
+            }
+            result = rx.recv() => {
+                match result {
+                    Ok(update) => Some(update),
+                    Err(broadcast::error::RecvError::Closed) => unreachable!(),
+                    Err(broadcast::error::RecvError::Lagged(_)) => None,
+                }
+            }
         }
     }
 
@@ -340,13 +346,6 @@ impl<S: Clone + Send + 'static> ProgressToken<S> {
         let rx = {
             let inner = self.node.inner.lock().unwrap();
             inner.update_sender.subscribe()
-        };
-
-        // Send initial state
-        let initial = ProgressUpdate {
-            progress: self.state(),
-            statuses: self.statuses(),
-            is_cancelled: false,
         };
 
         ProgressStream {
