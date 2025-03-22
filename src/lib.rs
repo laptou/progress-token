@@ -28,11 +28,16 @@ impl ProgressState {
 /// Data for a progress update event
 #[derive(Debug, Clone)]
 pub struct ProgressUpdate {
-    pub token_id: Uuid,
+    // pub token_id: Uuid,
     pub progress: ProgressState,
-    pub status: String,
     pub path: Vec<String>,
     pub is_cancelled: bool,
+}
+
+impl ProgressUpdate {
+    pub fn status(&self) -> &str {
+        self.path.last().unwrap()
+    }
 }
 
 /// Inner data of a progress node
@@ -103,17 +108,6 @@ impl ProgressNode {
 
         child
     }
-
-    // fn clone(&self) -> Self {
-    //     let mut inner = self.inner.lock().unwrap();
-    //     inner.handle_count += 1;
-
-    //     Self {
-    //         id: self.id,
-    //         inner: self.inner.clone(),
-    //         change_notify: self.change_notify.clone(),
-    //     }
-    // }
 
     fn calculate_progress(node: &Arc<Self>) -> ProgressState {
         let inner = node.inner.lock().unwrap();
@@ -186,19 +180,25 @@ impl ProgressNode {
     }
 
     fn notify_subscribers(node: &Arc<Self>, is_cancelled: bool) {
-        let inner = node.inner.lock().unwrap();
-
-        // Create update
-        let update = ProgressUpdate {
-            token_id: node.id,
-            progress: Self::calculate_progress(node),
-            status: inner.status.clone(),
-            path: Self::get_status_hierarchy(node),
-            is_cancelled,
+        // Create update while holding the lock
+        let update = {
+            // let inner = node.inner.lock().unwrap();
+            ProgressUpdate {
+                // token_id: node.id,
+                progress: Self::calculate_progress(node),
+                // status: inner.status.clone(),
+                path: Self::get_status_hierarchy(node),
+                is_cancelled,
+            }
         };
 
-        // Send to subscribers
-        for (_, sender) in &inner.subscribers {
+        // Send updates without holding the lock
+        let subscribers = {
+            let inner = node.inner.lock().unwrap();
+            inner.subscribers.clone()
+        };
+
+        for (_, sender) in &subscribers {
             let _ = sender.try_send(update.clone());
         }
 
@@ -206,8 +206,13 @@ impl ProgressNode {
         node.change_notify.notify_waiters();
 
         // Propagate to parent
-        if let Some(parent) = &inner.parent {
-            Self::notify_subscribers(parent, false);
+        let parent = {
+            let inner = node.inner.lock().unwrap();
+            inner.parent.clone()
+        };
+
+        if let Some(parent) = parent {
+            Self::notify_subscribers(&parent, false);
         }
     }
 
@@ -215,21 +220,21 @@ impl ProgressNode {
         let (tx, rx) = mpsc::channel(16);
         let id = Uuid::new_v4();
 
-        {
+        // Get initial state while holding the lock
+        let initial_update = {
             let mut inner = self.inner.lock().unwrap();
             inner.subscribers.insert(id, tx.clone());
-        }
-
-        // Send initial state
-        let update = ProgressUpdate {
-            token_id: self.id,
-            progress: self.inner.lock().unwrap().progress,
-            status: self.inner.lock().unwrap().status.clone(),
-            path: vec![self.inner.lock().unwrap().status.clone()],
-            is_cancelled: false,
+            ProgressUpdate {
+                // token_id: self.id,
+                progress: inner.progress,
+                // status: inner.status.clone(),
+                path: vec![inner.status.clone()],
+                is_cancelled: false,
+            }
         };
 
-        let _ = tx.try_send(update);
+        // Send initial update without holding the lock
+        let _ = tx.try_send(initial_update);
 
         (id, rx)
     }
@@ -395,5 +400,228 @@ impl Stream for ProgressSubscription {
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         Pin::new(&mut self.rx).poll_recv(cx)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+    use futures::StreamExt;
+    use tokio::time::sleep;
+
+    // helper function to create a test hierarchy
+    async fn create_test_hierarchy() -> (Arc<ProgressToken>, Arc<ProgressToken>, Arc<ProgressToken>)
+    {
+        let root = ProgressToken::new("root");
+        let child1 = ProgressToken::child(&root, 0.6, "child1");
+        let child2 = ProgressToken::child(&root, 0.4, "child2");
+        (root, child1, child2)
+    }
+
+    #[tokio::test]
+    async fn test_basic_progress_updates() {
+        let token = ProgressToken::new("test");
+        token.progress(0.5);
+        assert!(
+            matches!(token.value().await, ProgressState::Determinate(p) if (p - 0.5).abs() < f64::EPSILON)
+        );
+
+        token.progress(1.0);
+        assert!(
+            matches!(token.value().await, ProgressState::Determinate(p) if (p - 1.0).abs() < f64::EPSILON)
+        );
+
+        // test progress clamping
+        token.progress(1.5);
+        assert!(
+            matches!(token.value().await, ProgressState::Determinate(p) if (p - 1.0).abs() < f64::EPSILON)
+        );
+
+        token.progress(-0.5);
+        assert!(
+            matches!(token.value().await, ProgressState::Determinate(p) if p.abs() < f64::EPSILON)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_hierarchical_progress() {
+        let (root, child1, child2) = create_test_hierarchy().await;
+
+        // update children progress
+        child1.progress(0.5);
+        child2.progress(0.5);
+
+        // root progress should be weighted average: 0.5 * 0.6 + 0.5 * 0.4 = 0.5
+        assert!(
+            matches!(root.value().await, ProgressState::Determinate(p) if (p - 0.5).abs() < f64::EPSILON)
+        );
+
+        child1.progress(1.0);
+        // root progress should now be: 1.0 * 0.6 + 0.5 * 0.4 = 0.8
+        assert!(
+            matches!(root.value().await, ProgressState::Determinate(p) if (p - 0.8).abs() < f64::EPSILON)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_indeterminate_state() {
+        let (root, child1, child2) = create_test_hierarchy().await;
+
+        // set one child to indeterminate
+        child1.indeterminate();
+        child2.progress(0.5);
+
+        // root should be indeterminate
+        assert!(matches!(root.value().await, ProgressState::Indeterminate));
+
+        // set child back to determinate
+        child1.progress(0.5);
+        assert!(matches!(root.value().await, ProgressState::Determinate(_)));
+    }
+
+    #[tokio::test]
+    async fn test_status_updates() {
+        let token = ProgressToken::new("initial status");
+        let statuses = token.statuses().await;
+        assert_eq!(statuses, vec!["initial status"]);
+
+        token.status("updated status");
+        let statuses = token.statuses().await;
+        assert_eq!(statuses, vec!["updated status"]);
+    }
+
+    #[tokio::test]
+    async fn test_status_hierarchy() {
+        let (root, child1, _) = create_test_hierarchy().await;
+
+        let statuses = root.statuses().await;
+        assert_eq!(statuses, vec!["root", "child1"]);
+
+        child1.status("updated child1");
+        let statuses = root.statuses().await;
+        assert_eq!(statuses, vec!["root", "updated child1"]);
+    }
+
+    #[tokio::test]
+    async fn test_cancellation() {
+        let (root, child1, child2) = create_test_hierarchy().await;
+
+        // cancel root
+        root.cancel();
+
+        assert!(root.is_cancelled());
+        assert!(child1.is_cancelled());
+        assert!(child2.is_cancelled());
+
+        // updates should not be processed after cancellation
+        child1.progress(0.5);
+        assert!(
+            matches!(child1.value().await, ProgressState::Determinate(p) if p.abs() < f64::EPSILON)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_completion() {
+        let token = ProgressToken::new("test");
+        token.complete();
+
+        assert!(
+            matches!(token.value().await, ProgressState::Determinate(p) if (p - 1.0).abs() < f64::EPSILON)
+        );
+
+        // updates after completion should not be processed
+        token.progress(0.5);
+        assert!(
+            matches!(token.value().await, ProgressState::Determinate(p) if (p - 1.0).abs() < f64::EPSILON)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_subscription() {
+        let token = ProgressToken::new("test");
+        let mut subscription = token.subscribe();
+
+        // initial update
+        let update = subscription.next().await.unwrap();
+        assert_eq!(update.status(), "test");
+        assert!(matches!(update.progress, ProgressState::Determinate(p) if p.abs() < f64::EPSILON));
+
+        // progress update
+        token.progress(0.5);
+        let update = subscription.next().await.unwrap();
+        assert!(
+            matches!(update.progress, ProgressState::Determinate(p) if (p - 0.5).abs() < f64::EPSILON)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_multiple_subscribers() {
+        let token = ProgressToken::new("test");
+        let mut sub1 = token.subscribe();
+        let mut sub2 = token.subscribe();
+
+        // both subscribers should receive updates
+        token.progress(0.5);
+
+        let update1 = sub1.next().await.unwrap();
+        let update2 = sub2.next().await.unwrap();
+
+        assert!(
+            matches!(update1.progress, ProgressState::Determinate(p) if (p - 0.5).abs() < f64::EPSILON),
+            "{update1:?}"
+        );
+        assert!(
+            matches!(update2.progress, ProgressState::Determinate(p) if (p - 0.5).abs() < f64::EPSILON),
+            "{update2:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_updates() {
+        let token = Arc::new(ProgressToken::new("test"));
+        let mut handles = vec![];
+
+        // spawn multiple tasks updating the same token
+        for i in 0..10 {
+            let token = token.clone();
+            handles.push(tokio::spawn(async move {
+                sleep(Duration::from_millis(i * 10)).await;
+                token.progress(i as f64 / 10.0);
+            }));
+        }
+
+        // wait for all tasks to complete
+        for handle in handles {
+            handle.await.unwrap();
+        }
+
+        // final progress should be from the last update (0.9)
+        assert!(
+            matches!(token.value().await, ProgressState::Determinate(p) if (p - 0.9).abs() < f64::EPSILON)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_edge_cases() {
+        // single node tree
+        let token = ProgressToken::new("single");
+        token.progress(0.5);
+        assert!(
+            matches!(token.value().await, ProgressState::Determinate(p) if (p - 0.5).abs() < f64::EPSILON)
+        );
+
+        // deep hierarchy
+        let mut current = ProgressToken::new("root");
+        for i in 0..10 {
+            current = ProgressToken::child(&current, 1.0, format!("child{}", i));
+        }
+
+        // update leaf node
+        current.progress(1.0);
+        // progress should propagate to root
+        assert!(
+            matches!(current.value().await, ProgressState::Determinate(p) if (p - 1.0).abs() < f64::EPSILON)
+        );
     }
 }
