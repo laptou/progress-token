@@ -1,11 +1,10 @@
 use futures::{Stream, ready};
 use pin_project_lite::pin_project;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
-use std::time::Instant;
-use tokio::sync::{Notify, broadcast};
+use tokio::sync::broadcast;
 use tokio_stream::wrappers::BroadcastStream;
 use tokio_util::sync::{CancellationToken, WaitForCancellationFuture};
 
