@@ -6,9 +6,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
-use tokio::sync::{Notify, mpsc, oneshot};
+use tokio::sync::{Notify, broadcast, oneshot};
+use tokio_stream::wrappers::BroadcastStream;
 use tokio_util::sync::{CancellationToken, WaitForCancellationFuture};
-use uuid::Uuid;
 
 /// Represents either a determinate progress value or indeterminate state
 #[derive(Debug, Clone, Copy)]
@@ -28,20 +28,20 @@ impl Progress {
 
 /// Data for a progress update event
 #[derive(Debug, Clone)]
-pub struct ProgressUpdate<S: Clone> {
+pub struct ProgressUpdate<S> {
     pub progress: Progress,
     pub statuses: Vec<S>,
     pub is_cancelled: bool,
 }
 
-impl<S: Clone> ProgressUpdate<S> {
+impl<S> ProgressUpdate<S> {
     pub fn status(&self) -> &S {
         self.statuses.last().unwrap()
     }
 }
 
 /// Inner data of a progress node
-struct ProgressNodeInner<S: Clone> {
+struct ProgressNodeInner<S> {
     // Tree structure
     parent: Option<Arc<ProgressNode<S>>>,
     parent_idx: usize,
@@ -56,17 +56,20 @@ struct ProgressNodeInner<S: Clone> {
     handle_count: usize,
 
     // Subscriber management
-    subscribers: Vec<mpsc::Sender<ProgressUpdate<S>>>,
+    update_sender: broadcast::Sender<ProgressUpdate<S>>,
 }
 
 /// A node in the progress tree
-struct ProgressNode<S: Clone> {
+struct ProgressNode<S> {
     inner: Mutex<ProgressNodeInner<S>>,
     change_notify: Notify,
 }
 
-impl<S: Clone> ProgressNode<S> {
+impl<S: Clone + Send> ProgressNode<S> {
     fn new(status: S) -> Self {
+        // create broadcast channel with reasonable buffer size
+        let (tx, _) = broadcast::channel(16);
+        
         Self {
             inner: Mutex::new(ProgressNodeInner {
                 parent: None,
@@ -76,7 +79,7 @@ impl<S: Clone> ProgressNode<S> {
                 status,
                 is_completed: false,
                 handle_count: 1,
-                subscribers: Vec::new(),
+                update_sender: tx,
             }),
             change_notify: Notify::new(),
         }
@@ -84,6 +87,9 @@ impl<S: Clone> ProgressNode<S> {
 
     fn child(parent: &Arc<Self>, weight: f64, status: S) -> Arc<Self> {
         let mut parent_inner = parent.inner.lock().unwrap();
+        
+        // create broadcast channel with reasonable buffer size
+        let (tx, _) = broadcast::channel(16);
 
         let child = Self {
             inner: Mutex::new(ProgressNodeInner {
@@ -94,7 +100,7 @@ impl<S: Clone> ProgressNode<S> {
                 status,
                 is_completed: false,
                 handle_count: 1,
-                subscribers: Vec::new(),
+                update_sender: tx,
             }),
             change_notify: Notify::new(),
         };
@@ -181,13 +187,9 @@ impl<S: Clone> ProgressNode<S> {
 
         // Send updates without holding the lock
         {
-            let mut inner = node.inner.lock().unwrap();
-            inner
-                .subscribers
-                .retain(|subscriber| match subscriber.try_send(update.clone()) {
-                    Ok(_) => true,
-                    Err(_) => false,
-                });
+            let inner = node.inner.lock().unwrap();
+            // broadcast to all subscribers, ignore send errors (no subscribers/full)
+            let _ = inner.update_sender.send(update);
         };
 
         // Notify waiters
@@ -207,7 +209,7 @@ impl<S: Clone> ProgressNode<S> {
 
 /// A token that tracks the progress of a task and can be organized hierarchically
 #[derive(Clone)]
-pub struct ProgressToken<S: Clone> {
+pub struct ProgressToken<S> {
     node: Arc<ProgressNode<S>>,
     update_count: Arc<AtomicU64>,
     last_update: Instant,
@@ -215,7 +217,7 @@ pub struct ProgressToken<S: Clone> {
     cancel_token: CancellationToken,
 }
 
-impl<S: Clone> ProgressToken<S> {
+impl<S: Clone + Send + 'static> ProgressToken<S> {
     /// Create a new root ProgressToken
     pub fn new(status: S) -> Arc<Self> {
         let node = Arc::new(ProgressNode::new(status));
@@ -336,11 +338,10 @@ impl<S: Clone> ProgressToken<S> {
 
     /// Subscribe to progress updates from this token
     pub fn subscribe(&self) -> ProgressStream<'_, S> {
-        let (tx, rx) = mpsc::channel(8);
-
-        let mut inner = self.node.inner.lock().unwrap();
-        inner.subscribers.push(tx.clone());
-        drop(inner);
+        let rx = {
+            let inner = self.node.inner.lock().unwrap();
+            inner.update_sender.subscribe()
+        };
 
         // Send initial state
         let initial = ProgressUpdate {
@@ -348,9 +349,11 @@ impl<S: Clone> ProgressToken<S> {
             statuses: self.statuses(),
             is_cancelled: false,
         };
-        let _ = tx.try_send(initial);
 
-        ProgressStream { token: self, rx }
+        ProgressStream { 
+            token: self, 
+            rx: BroadcastStream::new(rx)
+        }
     }
 }
 
@@ -358,14 +361,14 @@ pin_project! {
     /// A Future that is resolved once the corresponding [`ProgressToken`]
     /// is updated. Resolves to `None` if the progress token is cancelled.
     #[must_use = "futures do nothing unless polled"]
-    pub struct WaitForUpdateFuture<'a, S: Clone> {
+    pub struct WaitForUpdateFuture<'a, S> {
         token: &'a ProgressToken<S>,
         #[pin]
         future: tokio::sync::futures::Notified<'a>,
     }
 }
 
-impl<'a, S: Clone> Future for WaitForUpdateFuture<'a, S> {
+impl<'a, S: Clone + Send + 'static> Future for WaitForUpdateFuture<'a, S> {
     type Output = Option<ProgressUpdate<S>>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
@@ -387,18 +390,18 @@ impl<'a, S: Clone> Future for WaitForUpdateFuture<'a, S> {
 pin_project! {
     /// A Stream that yields progress updates from a token
     #[must_use = "streams do nothing unless polled"]
-    pub struct ProgressStream<'a, S: Clone> {
+    pub struct ProgressStream<'a, S> {
         token: &'a ProgressToken<S>,
-        rx: mpsc::Receiver<ProgressUpdate<S>>,
+        #[pin]
+        rx: BroadcastStream<ProgressUpdate<S>>,
     }
 }
 
-impl<'a, S: Clone> Stream for ProgressStream<'a, S> {
+impl<'a, S: Clone + Send + 'static> Stream for ProgressStream<'a, S> {
     type Item = ProgressUpdate<S>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let this = self.project();
-        this.rx.poll_recv(cx)
+        self.project().rx.poll_next(cx).map(|opt| opt.map(|res| res.unwrap()))
     }
 }
 
