@@ -29,6 +29,8 @@ pub enum ProgressError {
     /// Too many progress updates have occurred since last polled, so some of
     /// them have been dropped
     Lagged,
+    /// This progress token has been cancelled, no more updates are coming
+    Cancelled,
 }
 
 /// Data for a progress update event
@@ -320,7 +322,7 @@ impl<S: Clone + Send + 'static> ProgressToken<S> {
         self.cancel_token.cancelled()
     }
 
-    pub async fn updated(&self) -> Option<ProgressUpdate<S>> {
+    pub async fn updated(&self) -> Result<ProgressUpdate<S>, ProgressError> {
         let mut rx = {
             let inner = self.node.inner.lock().unwrap();
             inner.update_sender.subscribe()
@@ -328,13 +330,13 @@ impl<S: Clone + Send + 'static> ProgressToken<S> {
 
         tokio::select! {
             _ = self.cancel_token.cancelled() => {
-                None
+                Err(ProgressError::Cancelled)
             }
             result = rx.recv() => {
                 match result {
-                    Ok(update) => Some(update),
-                    Err(broadcast::error::RecvError::Closed) => unreachable!(),
-                    Err(broadcast::error::RecvError::Lagged(_)) => None,
+                    Ok(update) => Ok(update),
+                    Err(broadcast::error::RecvError::Closed) => Err(ProgressError::Cancelled),
+                    Err(broadcast::error::RecvError::Lagged(_)) => Err(ProgressError::Lagged),
                 }
             }
         }

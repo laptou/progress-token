@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-tokio = { version = "1.44", features = ["sync"] }
+tokio = { version = "1.44", features = ["sync", "macros"] }
 tokio-util = "0.7.14"
 tokio-stream = { version = "0.1", features = ["sync"] }
 futures = { version = "0.3", features = ["std"] }
