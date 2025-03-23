@@ -2,6 +2,10 @@
 name = "progress-token"
 version = "0.1.0"
 edition = "2024"
+authors = ["Ibiyemi Abiodun <ibiyemi@intulon.com>"]
+description = "A library for tracking progress of long-running tasks"
+license = "MIT"
+repository = "https://github.com/laptou/progress-token"
 
 [dependencies]
 tokio = { version = "1.44", features = ["sync", "macros"] }
