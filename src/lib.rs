@@ -216,8 +216,8 @@ pub struct ProgressToken<S> {
 
 impl<S: Clone + Send + 'static> ProgressToken<S> {
     /// Create a new root ProgressToken
-    pub fn new(status: S) -> Arc<Self> {
-        let node = Arc::new(ProgressNode::new(status));
+    pub fn new(status: impl Into<S>) -> Arc<Self> {
+        let node = Arc::new(ProgressNode::new(status.into()));
 
         Arc::new(Self {
             node,
@@ -227,8 +227,8 @@ impl<S: Clone + Send + 'static> ProgressToken<S> {
     }
 
     /// Create a child token
-    pub fn child(parent: &Arc<Self>, weight: f64, status: S) -> Arc<Self> {
-        let node = ProgressNode::child(&parent.node, weight, status);
+    pub fn child(parent: &Arc<Self>, weight: f64, status: impl Into<S>) -> Arc<Self> {
+        let node = ProgressNode::child(&parent.node, weight, status.into());
 
         Arc::new(Self {
             node,
@@ -270,13 +270,13 @@ impl<S: Clone + Send + 'static> ProgressToken<S> {
     }
 
     /// Update the status message
-    pub fn status(&self, status: S) {
+    pub fn status(&self, status: impl Into<S>) {
         if !self.is_active.load(Ordering::Relaxed) || self.cancel_token.is_cancelled() {
             return;
         }
 
         let mut inner = self.node.inner.lock().unwrap();
-        inner.status = status;
+        inner.status = status.into();
         drop(inner);
 
         ProgressNode::notify_subscribers(&self.node, false);
