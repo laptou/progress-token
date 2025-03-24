@@ -120,6 +120,7 @@ use tokio_util::sync::{CancellationToken, WaitForCancellationFuture};
 
 /// Represents either a determinate progress value or indeterminate state
 #[derive(Debug, Clone, Copy)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum Progress {
     Determinate(f64),
     Indeterminate,
@@ -145,6 +146,7 @@ pub enum ProgressError {
 
 /// Data for a progress update event
 #[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct ProgressUpdate<S> {
     pub progress: Progress,
     pub statuses: Vec<S>,
@@ -324,27 +326,36 @@ pub struct ProgressToken<S> {
     cancel_token: CancellationToken,
 }
 
+impl<S: std::fmt::Debug> std::fmt::Debug for ProgressToken<S> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProgressToken")
+            .field("is_active", &self.is_active.load(Ordering::Relaxed))
+            .field("is_cancelled", &self.cancel_token.is_cancelled())
+            .finish()
+    }
+}
+
 impl<S: Clone + Send + 'static> ProgressToken<S> {
     /// Create a new root ProgressToken
-    pub fn new(status: impl Into<S>) -> Arc<Self> {
+    pub fn new(status: impl Into<S>) -> Self {
         let node = Arc::new(ProgressNode::new(status.into()));
 
-        Arc::new(Self {
+        Self {
             node,
             is_active: Arc::new(AtomicBool::new(true)),
             cancel_token: CancellationToken::new(),
-        })
+        }
     }
 
     /// Create a child token
-    pub fn child(parent: &Arc<Self>, weight: f64, status: impl Into<S>) -> Arc<Self> {
+    pub fn child(parent: &Self, weight: f64, status: impl Into<S>) -> Self {
         let node = ProgressNode::child(&parent.node, weight, status.into());
 
-        Arc::new(Self {
+        Self {
             node,
             is_active: Arc::new(AtomicBool::new(true)),
             cancel_token: parent.cancel_token.child_token(),
-        })
+        }
     }
 
     /// Update the progress of this token
@@ -526,9 +537,9 @@ mod tests {
 
     // helper function to create a test hierarchy
     async fn create_test_hierarchy() -> (
-        Arc<ProgressToken<String>>,
-        Arc<ProgressToken<String>>,
-        Arc<ProgressToken<String>>,
+        ProgressToken<String>,
+        ProgressToken<String>,
+        ProgressToken<String>,
     ) {
         let root = ProgressToken::new("root".to_string());
         let child1 = ProgressToken::child(&root, 0.6, "child1".to_string());
@@ -538,7 +549,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_basic_progress_updates() {
-        let token = ProgressToken::new("test".to_string());
+        let token: ProgressToken<String> = ProgressToken::new("test".to_string());
         token.progress(0.5);
         assert!(
             matches!(token.state(), Progress::Determinate(p) if (p - 0.5).abs() < f64::EPSILON)
@@ -593,7 +604,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_status_updates() {
-        let token = ProgressToken::new("initial status".to_string());
+        let token: ProgressToken<String> = ProgressToken::new("initial status".to_string());
         let statuses = token.statuses();
         assert_eq!(statuses, vec!["initial status".to_string()]);
 
@@ -635,7 +646,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_completion() {
-        let token = ProgressToken::new("test".to_string());
+        let token: ProgressToken<String> = ProgressToken::new("test".to_string());
         token.complete();
 
         assert!(
@@ -651,7 +662,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_subscription() {
-        let token = ProgressToken::new("test".to_string());
+        let token: ProgressToken<String> = ProgressToken::new("test".to_string());
         let mut subscription = token.subscribe();
 
         // initial update
@@ -669,7 +680,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_multiple_subscribers() {
-        let token = ProgressToken::new("test".to_string());
+        let token: ProgressToken<String> = ProgressToken::new("test".to_string());
         let mut sub1 = token.subscribe();
         let mut sub2 = token.subscribe();
 
@@ -695,7 +706,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_concurrent_updates() {
-        let token = Arc::new(ProgressToken::new("test".to_string()));
+        let token: ProgressToken<String> = ProgressToken::new("test".to_string());
         let mut handles = vec![];
 
         // spawn multiple tasks updating the same token
@@ -721,14 +732,14 @@ mod tests {
     #[tokio::test]
     async fn test_edge_cases() {
         // single node tree
-        let token = ProgressToken::new("single".to_string());
+        let token: ProgressToken<String> = ProgressToken::new("single".to_string());
         token.progress(0.5);
         assert!(
             matches!(token.state(), Progress::Determinate(p) if (p - 0.5).abs() < f64::EPSILON)
         );
 
         // deep hierarchy
-        let mut current = ProgressToken::new("root".to_string());
+        let mut current: ProgressToken<String> = ProgressToken::new("root".to_string());
         for i in 0..10 {
             current = ProgressToken::child(&current, 1.0, format!("child{}", i));
         }
