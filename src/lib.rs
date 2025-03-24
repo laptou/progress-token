@@ -49,8 +49,8 @@
 //!     let root = ProgressToken::new("Main task");
 //!     
 //!     // Create child tasks with weights
-//!     let process = ProgressToken::child(&root, 0.7, "Processing"); // 70% of total
-//!     let cleanup = ProgressToken::child(&root, 0.3, "Cleanup");    // 30% of total
+//!     let process = root.child(0.7, "Processing"); // 70% of total
+//!     let cleanup = root.child(0.3, "Cleanup");    // 30% of total
 //!     
 //!     // Child progress is automatically weighted and propagated
 //!     process.progress(0.5);  // Root progress becomes 0.35 (0.5 * 0.7)
@@ -69,7 +69,7 @@
 //! #[tokio::main]
 //! async fn main() {
 //!     let root = ProgressToken::new("Backup");
-//!     let compress = ProgressToken::child(&root, 1.0, "Compressing files");
+//!     let compress = root.child(1.0, "Compressing files");
 //!     
 //!     // Update status with more specific information
 //!     compress.status("Compressing images/photo1.jpg");
@@ -348,13 +348,13 @@ impl<S: Clone + Send + 'static> ProgressToken<S> {
     }
 
     /// Create a child token
-    pub fn child(parent: &Self, weight: f64, status: impl Into<S>) -> Self {
-        let node = ProgressNode::child(&parent.node, weight, status.into());
+    pub fn child(&self, weight: f64, status: impl Into<S>) -> Self {
+        let node = ProgressNode::child(&self.node, weight, status.into());
 
         Self {
             node,
             is_active: Arc::new(AtomicBool::new(true)),
-            cancel_token: parent.cancel_token.child_token(),
+            cancel_token: self.cancel_token.child_token(),
         }
     }
 
@@ -542,8 +542,8 @@ mod tests {
         ProgressToken<String>,
     ) {
         let root = ProgressToken::new("root".to_string());
-        let child1 = ProgressToken::child(&root, 0.6, "child1".to_string());
-        let child2 = ProgressToken::child(&root, 0.4, "child2".to_string());
+        let child1 = root.child(0.6, "child1".to_string());
+        let child2 = root.child(0.4, "child2".to_string());
         (root, child1, child2)
     }
 
@@ -741,7 +741,7 @@ mod tests {
         // deep hierarchy
         let mut current: ProgressToken<String> = ProgressToken::new("root".to_string());
         for i in 0..10 {
-            current = ProgressToken::child(&current, 1.0, format!("child{}", i));
+            current = current.child(1.0, format!("child{}", i));
         }
 
         // update leaf node

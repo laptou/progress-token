@@ -35,8 +35,8 @@ async fn main() {
     let root = ProgressToken::new("Main task");
     
     // Create child tasks with weights
-    let process = ProgressToken::child(&root, 0.7, "Processing"); // 70% of total
-    let cleanup = ProgressToken::child(&root, 0.3, "Cleanup");    // 30% of total
+    let process = root.child(0.7, "Processing"); // 70% of total
+    let cleanup = root.child(0.3, "Cleanup");    // 30% of total
     
     // Subscribe to progress updates
     let mut updates = root.subscribe();
@@ -71,7 +71,7 @@ Status messages propagate through the hierarchy, with the most specific (deepest
 
 ```rust
 let root = ProgressToken::new("Backup");
-let compress = ProgressToken::child(&root, 1.0, "Compressing files");
+let compress = root.child(1.0, "Compressing files");
 
 // Update status with more specific information
 compress.status("Compressing images/photo1.jpg");

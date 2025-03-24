@@ -76,8 +76,8 @@ async fn main() {
     let root = ProgressToken::new("main task");
     
     // create child tokens with specified weights
-    let process = ProgressToken::child(&root, 0.7, "processing");
-    let cleanup = ProgressToken::child(&root, 0.3, "cleanup");
+    let process = root.child(0.7, "processing");
+    let cleanup = root.child(0.3, "cleanup");
     
     // update progress in child tokens
     process.progress(0.5); // contributes 0.35 (0.7 * 0.5)
@@ -249,8 +249,8 @@ async fn main() {
     let root = ProgressToken::new("backup task");
     
     // create child tokens with weights
-    let compress = ProgressToken::child(&root, 0.8, "compress files");
-    let upload = ProgressToken::child(&root, 0.2, "upload files");
+    let compress = root.child(0.8, "compress files");
+    let upload = root.child(0.2, "upload files");
     
     // update child token progress
     compress.progress(0.75); // weighted to 0.6 overall
