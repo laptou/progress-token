@@ -124,10 +124,10 @@
 
 use futures::{Stream, ready};
 use pin_project_lite::pin_project;
-use thiserror::Error;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
+use thiserror::Error;
 use tokio::sync::broadcast;
 use tokio_stream::wrappers::BroadcastStream;
 use tokio_util::sync::{CancellationToken, WaitForCancellationFuture};
@@ -390,8 +390,8 @@ impl<S: Clone + Send + 'static> ProgressToken<S> {
     }
 
     /// Update the progress of this token
-    pub fn progress(&self, progress: f64) {
-        if self.cancel_token.is_cancelled() {
+    pub fn update_progress(&self, progress: f64) {
+        if self.is_cancelled() {
             return;
         }
 
@@ -412,8 +412,8 @@ impl<S: Clone + Send + 'static> ProgressToken<S> {
     }
 
     /// Set the progress state to indeterminate
-    pub fn indeterminate(&self) {
-        if self.cancel_token.is_cancelled() {
+    pub fn update_indeterminate(&self) {
+        if self.is_cancelled() {
             return;
         }
 
@@ -429,8 +429,8 @@ impl<S: Clone + Send + 'static> ProgressToken<S> {
     }
 
     /// Update the status message
-    pub fn status(&self, status: impl Into<S>) {
-        if self.cancel_token.is_cancelled() {
+    pub fn update_status(&self, status: impl Into<S>) {
+        if self.is_cancelled() {
             return;
         }
 
@@ -445,9 +445,27 @@ impl<S: Clone + Send + 'static> ProgressToken<S> {
         ProgressNode::notify_subscribers(&self.node, false);
     }
 
+    /// Update the progress and status message
+    pub fn update(&self, progress: Progress, status: impl Into<S>) {
+        if self.is_cancelled() {
+            return;
+        }
+
+        let mut inner = self.node.inner.lock().unwrap();
+        if inner.is_completed {
+            return;
+        }
+
+        inner.status = status.into();
+        inner.progress = progress;
+        drop(inner);
+
+        ProgressNode::notify_subscribers(&self.node, false);
+    }
+
     /// Mark the task as complete
     pub fn complete(&self) {
-        if self.cancel_token.is_cancelled() {
+        if self.is_cancelled() {
             return;
         }
 
@@ -463,11 +481,15 @@ impl<S: Clone + Send + 'static> ProgressToken<S> {
 
     /// Returns ProgressError::Cancelled if the token is cancelled, otherwise Ok.
     pub fn check(&self) -> Result<(), ProgressError> {
-        if self.cancel_token.is_cancelled() {
+        if self.is_cancelled() {
             Err(ProgressError::Cancelled)
         } else {
             Ok(())
         }
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.cancel_token.is_cancelled()
     }
 
     /// Cancel this task and all its children
@@ -604,23 +626,23 @@ mod tests {
     #[tokio::test]
     async fn test_basic_progress_updates() {
         let token: ProgressToken<String> = ProgressToken::new("test".to_string());
-        token.progress(0.5);
+        token.update_progress(0.5);
         assert!(
             matches!(token.state(), Progress::Determinate(p) if (p - 0.5).abs() < f64::EPSILON)
         );
 
-        token.progress(1.0);
+        token.update_progress(1.0);
         assert!(
             matches!(token.state(), Progress::Determinate(p) if (p - 1.0).abs() < f64::EPSILON)
         );
 
         // test progress clamping
-        token.progress(1.5);
+        token.update_progress(1.5);
         assert!(
             matches!(token.state(), Progress::Determinate(p) if (p - 1.0).abs() < f64::EPSILON)
         );
 
-        token.progress(-0.5);
+        token.update_progress(-0.5);
         assert!(matches!(token.state(), Progress::Determinate(p) if p.abs() < f64::EPSILON));
     }
 
@@ -629,13 +651,13 @@ mod tests {
         let (root, child1, child2) = create_test_hierarchy().await;
 
         // update children progress
-        child1.progress(0.5);
-        child2.progress(0.5);
+        child1.update_progress(0.5);
+        child2.update_progress(0.5);
 
         // root progress should be weighted average: 0.5 * 0.6 + 0.5 * 0.4 = 0.5
         assert!(matches!(root.state(), Progress::Determinate(p) if (p - 0.5).abs() < f64::EPSILON));
 
-        child1.progress(1.0);
+        child1.update_progress(1.0);
         // root progress should now be: 1.0 * 0.6 + 0.5 * 0.4 = 0.8
         assert!(matches!(root.state(), Progress::Determinate(p) if (p - 0.8).abs() < f64::EPSILON));
     }
@@ -645,14 +667,14 @@ mod tests {
         let (root, child1, child2) = create_test_hierarchy().await;
 
         // set one child to indeterminate
-        child1.indeterminate();
-        child2.progress(0.5);
+        child1.update_indeterminate();
+        child2.update_progress(0.5);
 
         // root should be indeterminate
         assert!(matches!(root.state(), Progress::Indeterminate));
 
         // set child back to determinate
-        child1.progress(0.5);
+        child1.update_progress(0.5);
         assert!(matches!(root.state(), Progress::Determinate(_)));
     }
 
@@ -662,7 +684,7 @@ mod tests {
         let statuses = token.statuses();
         assert_eq!(statuses, vec!["initial status".to_string()]);
 
-        token.status("updated status".to_string());
+        token.update_status("updated status".to_string());
         let statuses = token.statuses();
         assert_eq!(statuses, vec!["updated status".to_string()]);
     }
@@ -674,7 +696,7 @@ mod tests {
         let statuses = root.statuses();
         assert_eq!(statuses, vec!["root".to_string(), "child1".to_string()]);
 
-        child1.status("updated child1".to_string());
+        child1.update_status("updated child1".to_string());
         let statuses = root.statuses();
         assert_eq!(
             statuses,
@@ -694,37 +716,45 @@ mod tests {
         assert!(child2.cancel_token.is_cancelled());
 
         // updates should not be processed after cancellation
-        child1.progress(0.5);
+        child1.update_progress(0.5);
         assert!(matches!(child1.state(), Progress::Determinate(p) if p.abs() < f64::EPSILON));
     }
 
     #[tokio::test]
     async fn test_complete_guard() {
         let token: ProgressToken<String> = ProgressToken::new("test".to_string());
-        
+
         {
             let _guard = token.complete_guard();
-            token.progress(0.5);
-            assert!(matches!(token.state(), Progress::Determinate(p) if (p - 0.5).abs() < f64::EPSILON));
+            token.update_progress(0.5);
+            assert!(
+                matches!(token.state(), Progress::Determinate(p) if (p - 0.5).abs() < f64::EPSILON)
+            );
         } // guard is dropped here, token should be completed
 
         // token should be completed and at progress 1.0
-        assert!(matches!(token.state(), Progress::Determinate(p) if (p - 1.0).abs() < f64::EPSILON));
-        
+        assert!(
+            matches!(token.state(), Progress::Determinate(p) if (p - 1.0).abs() < f64::EPSILON)
+        );
+
         // updates after completion should be ignored
-        token.progress(0.5);
-        assert!(matches!(token.state(), Progress::Determinate(p) if (p - 1.0).abs() < f64::EPSILON));
+        token.update_progress(0.5);
+        assert!(
+            matches!(token.state(), Progress::Determinate(p) if (p - 1.0).abs() < f64::EPSILON)
+        );
 
         // test forget
         let token: ProgressToken<String> = ProgressToken::new("test2".to_string());
         {
             let guard = token.complete_guard();
-            token.progress(0.5);
+            token.update_progress(0.5);
             guard.forget(); // prevent completion
         }
-        
+
         // token should still be at 0.5 since guard was forgotten
-        assert!(matches!(token.state(), Progress::Determinate(p) if (p - 0.5).abs() < f64::EPSILON));
+        assert!(
+            matches!(token.state(), Progress::Determinate(p) if (p - 0.5).abs() < f64::EPSILON)
+        );
     }
 
     #[tokio::test]
@@ -738,7 +768,7 @@ mod tests {
         assert!(matches!(update.progress, Progress::Determinate(p) if p.abs() < f64::EPSILON));
 
         // progress update
-        token.progress(0.5);
+        token.update_progress(0.5);
         let update = subscription.next().await.unwrap();
         assert!(
             matches!(update.progress, Progress::Determinate(p) if (p - 0.5).abs() < f64::EPSILON)
@@ -756,7 +786,7 @@ mod tests {
         sub2.next().await.unwrap();
 
         // both subscribers should receive updates
-        token.progress(0.5);
+        token.update_progress(0.5);
 
         let update1 = sub1.next().await.unwrap();
         let update2 = sub2.next().await.unwrap();
@@ -781,7 +811,7 @@ mod tests {
             let token = token.clone();
             handles.push(tokio::spawn(async move {
                 sleep(Duration::from_millis(i * 10)).await;
-                token.progress(i as f64 / 10.0);
+                token.update_progress(i as f64 / 10.0);
             }));
         }
 
@@ -800,7 +830,7 @@ mod tests {
     async fn test_edge_cases() {
         // single node tree
         let token: ProgressToken<String> = ProgressToken::new("single".to_string());
-        token.progress(0.5);
+        token.update_progress(0.5);
         assert!(
             matches!(token.state(), Progress::Determinate(p) if (p - 0.5).abs() < f64::EPSILON)
         );
@@ -812,7 +842,7 @@ mod tests {
         }
 
         // update leaf node
-        current.progress(1.0);
+        current.update_progress(1.0);
         // progress should propagate to root
         assert!(
             matches!(current.state(), Progress::Determinate(p) if (p - 1.0).abs() < f64::EPSILON)
