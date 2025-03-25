@@ -871,4 +871,134 @@ mod tests {
             "child1 progress should be 100% when all grandchildren complete"
         );
     }
+
+    #[tokio::test]
+    async fn test_status_propagation() {
+        let root: ProgressToken<String> = ProgressToken::new("root".to_string());
+        let child1 = root.child(0.6, "child1".to_string());
+        let child2 = root.child(0.4, "child2".to_string());
+        let grandchild1 = child1.child(1.0, "grandchild1".to_string());
+
+        // initial status hierarchy
+        let statuses = root.statuses();
+        assert_eq!(
+            statuses,
+            vec!["root".to_string(), "child1".to_string(), "grandchild1".to_string()]
+        );
+
+        // update grandchild status
+        grandchild1.update_status("updated grandchild".to_string());
+        let statuses = root.statuses();
+        assert_eq!(
+            statuses,
+            vec!["root".to_string(), "child1".to_string(), "updated grandchild".to_string()]
+        );
+
+        // update child status
+        child1.update_status("updated child1".to_string());
+        let statuses = root.statuses();
+        assert_eq!(
+            statuses,
+            vec!["root".to_string(), "updated child1".to_string(), "updated grandchild".to_string()]
+        );
+
+        // update root status
+        root.update_status("updated root".to_string());
+        let statuses = root.statuses();
+        assert_eq!(
+            statuses,
+            vec!["updated root".to_string(), "updated child1".to_string(), "updated grandchild".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_status_propagation_with_multiple_children() {
+        let root: ProgressToken<String> = ProgressToken::new("root".to_string());
+        let child1 = root.child(0.5, "child1".to_string());
+        let child2 = root.child(0.5, "child2".to_string());
+        
+        let grandchild1_1 = child1.child(0.7, "grandchild1_1".to_string());
+        let grandchild1_2 = child1.child(0.3, "grandchild1_2".to_string());
+        let grandchild2_1 = child2.child(1.0, "grandchild2_1".to_string());
+
+        // initial status hierarchy should show active path
+        let statuses = root.statuses();
+        assert_eq!(
+            statuses,
+            vec!["root".to_string(), "child1".to_string(), "grandchild1_1".to_string()]
+        );
+
+        // update status of inactive grandchild
+        grandchild1_2.update_status("updated grandchild1_2".to_string());
+        let statuses = root.statuses();
+        assert_eq!(
+            statuses,
+            vec!["root".to_string(), "child1".to_string(), "grandchild1_1".to_string()]
+        );
+
+        // update status of active grandchild
+        grandchild1_1.update_status("updated grandchild1_1".to_string());
+        let statuses = root.statuses();
+        assert_eq!(
+            statuses,
+            vec!["root".to_string(), "child1".to_string(), "updated grandchild1_1".to_string()]
+        );
+
+        // update status of other branch's grandchild
+        grandchild2_1.update_status("updated grandchild2_1".to_string());
+        let statuses = root.statuses();
+        assert_eq!(
+            statuses,
+            vec!["root".to_string(), "child1".to_string(), "updated grandchild1_1".to_string()]
+        );
+
+        // update status of other branch's child
+        child2.update_status("updated child2".to_string());
+        let statuses = root.statuses();
+        assert_eq!(
+            statuses,
+            vec!["root".to_string(), "child1".to_string(), "updated grandchild1_1".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_status_propagation_with_completion() {
+        let root: ProgressToken<String> = ProgressToken::new("root".to_string());
+        let child1 = root.child(0.6, "child1".to_string());
+        let child2 = root.child(0.4, "child2".to_string());
+        let grandchild1 = child1.child(1.0, "grandchild1".to_string());
+
+        // initial status hierarchy
+        let statuses = root.statuses();
+        assert_eq!(
+            statuses,
+            vec!["root".to_string(), "child1".to_string(), "grandchild1".to_string()]
+        );
+
+        // update grandchild status and complete it
+        grandchild1.update_status("completed grandchild".to_string());
+        grandchild1.complete();
+        let statuses = root.statuses();
+        assert_eq!(
+            statuses,
+            vec!["root".to_string(), "child1".to_string()]
+        );
+
+        // update child status and complete it
+        child1.update_status("completed child1".to_string());
+        child1.complete();
+        let statuses = root.statuses();
+        assert_eq!(
+            statuses,
+            vec!["root".to_string(), "child2".to_string()]
+        );
+
+        // update remaining child status
+        child2.update_status("updated child2".to_string());
+        let statuses = root.statuses();
+        assert_eq!(
+            statuses,
+            vec!["root".to_string(), "updated child2".to_string()]
+        );
+    }
 }
