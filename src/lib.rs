@@ -8,7 +8,10 @@ use std::task::{Context, Poll};
 use thiserror::Error;
 use tokio::sync::broadcast;
 use tokio_stream::wrappers::BroadcastStream;
-use tokio_util::sync::{CancellationToken, WaitForCancellationFuture, WaitForCancellationFutureOwned};
+use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
+use tokio_util::sync::{
+    CancellationToken, WaitForCancellationFuture, WaitForCancellationFutureOwned,
+};
 
 /// A guard that automatically marks a [`ProgressToken`] as complete when dropped
 #[must_use = "if unused, the progress token will be completed immediately"]
@@ -482,13 +485,15 @@ pin_project! {
 }
 
 impl<'a, S: Clone + Send + 'static> Stream for ProgressStream<'a, S> {
-    type Item = ProgressUpdate<S>;
+    type Item = Result<ProgressUpdate<S>, ProgressError>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        self.project()
-            .rx
-            .poll_next(cx)
-            .map(|opt| opt.map(|res| res.unwrap()))
+        self.project().rx.poll_next(cx).map(|opt| {
+            opt.and_then(|res| match res {
+                Ok(update) => Some(Ok(update)),
+                Err(BroadcastStreamRecvError::Lagged(_)) => Some(Err(ProgressError::Lagged)),
+            })
+        })
     }
 }
 
@@ -657,7 +662,7 @@ mod tests {
 
         // progress update
         token.update_progress(0.5);
-        let update = subscription.next().await.unwrap();
+        let update = subscription.next().await.unwrap().unwrap();
         assert!(
             matches!(update.progress, Progress::Determinate(p) if (p - 0.5).abs() < f64::EPSILON)
         );
@@ -672,8 +677,8 @@ mod tests {
         // both subscribers should receive updates
         token.update_progress(0.5);
 
-        let update1 = sub1.next().await.unwrap();
-        let update2 = sub2.next().await.unwrap();
+        let update1 = sub1.next().await.unwrap().unwrap();
+        let update2 = sub2.next().await.unwrap().unwrap();
 
         assert!(
             matches!(update1.progress, Progress::Determinate(p) if (p - 0.5).abs() < f64::EPSILON),
@@ -687,8 +692,8 @@ mod tests {
         // test that both subscribers receive subsequent updates
         token.update_progress(0.75);
 
-        let update1 = sub1.next().await.unwrap();
-        let update2 = sub2.next().await.unwrap();
+        let update1 = sub1.next().await.unwrap().unwrap();
+        let update2 = sub2.next().await.unwrap().unwrap();
 
         assert!(
             matches!(update1.progress, Progress::Determinate(p) if (p - 0.75).abs() < f64::EPSILON),
@@ -752,10 +757,10 @@ mod tests {
     async fn test_three_level_hierarchy_progress() {
         // create a three-level hierarchy with weighted progress
         let root: ProgressToken<String> = ProgressToken::new("root".to_string());
-        
+
         let child1 = root.child(0.7, "child1".to_string());
         let child2 = root.child(0.3, "child2".to_string());
-        
+
         let grandchild1_1 = child1.child(0.6, "grandchild1_1".to_string());
         let grandchild1_2 = child1.child(0.4, "grandchild1_2".to_string());
         let grandchild2_1 = child2.child(1.0, "grandchild2_1".to_string());
@@ -826,7 +831,10 @@ mod tests {
 
         // verify root is not marked as completed
         let mut root_inner = root.node.inner.lock().unwrap();
-        assert!(!root_inner.is_completed, "root should not be auto-completed when children complete");
+        assert!(
+            !root_inner.is_completed,
+            "root should not be auto-completed when children complete"
+        );
     }
 
     #[tokio::test]
@@ -834,7 +842,7 @@ mod tests {
         let root: ProgressToken<String> = ProgressToken::new("root".to_string());
         let child1 = root.child(0.5, "child1".to_string());
         let child2 = root.child(0.5, "child2".to_string());
-        
+
         let grandchild1_1 = child1.child(0.7, "grandchild1_1".to_string());
         let grandchild1_2 = child1.child(0.3, "grandchild1_2".to_string());
 
@@ -883,7 +891,11 @@ mod tests {
         let statuses = root.statuses();
         assert_eq!(
             statuses,
-            vec!["root".to_string(), "child1".to_string(), "grandchild1".to_string()]
+            vec![
+                "root".to_string(),
+                "child1".to_string(),
+                "grandchild1".to_string()
+            ]
         );
 
         // update grandchild status
@@ -891,7 +903,11 @@ mod tests {
         let statuses = root.statuses();
         assert_eq!(
             statuses,
-            vec!["root".to_string(), "child1".to_string(), "updated grandchild".to_string()]
+            vec![
+                "root".to_string(),
+                "child1".to_string(),
+                "updated grandchild".to_string()
+            ]
         );
 
         // update child status
@@ -899,7 +915,11 @@ mod tests {
         let statuses = root.statuses();
         assert_eq!(
             statuses,
-            vec!["root".to_string(), "updated child1".to_string(), "updated grandchild".to_string()]
+            vec![
+                "root".to_string(),
+                "updated child1".to_string(),
+                "updated grandchild".to_string()
+            ]
         );
 
         // update root status
@@ -907,7 +927,11 @@ mod tests {
         let statuses = root.statuses();
         assert_eq!(
             statuses,
-            vec!["updated root".to_string(), "updated child1".to_string(), "updated grandchild".to_string()]
+            vec![
+                "updated root".to_string(),
+                "updated child1".to_string(),
+                "updated grandchild".to_string()
+            ]
         );
     }
 
@@ -916,7 +940,7 @@ mod tests {
         let root: ProgressToken<String> = ProgressToken::new("root".to_string());
         let child1 = root.child(0.5, "child1".to_string());
         let child2 = root.child(0.5, "child2".to_string());
-        
+
         let grandchild1_1 = child1.child(0.7, "grandchild1_1".to_string());
         let grandchild1_2 = child1.child(0.3, "grandchild1_2".to_string());
         let grandchild2_1 = child2.child(1.0, "grandchild2_1".to_string());
@@ -925,7 +949,11 @@ mod tests {
         let statuses = root.statuses();
         assert_eq!(
             statuses,
-            vec!["root".to_string(), "child1".to_string(), "grandchild1_1".to_string()]
+            vec![
+                "root".to_string(),
+                "child1".to_string(),
+                "grandchild1_1".to_string()
+            ]
         );
 
         // update status of inactive grandchild
@@ -933,7 +961,11 @@ mod tests {
         let statuses = root.statuses();
         assert_eq!(
             statuses,
-            vec!["root".to_string(), "child1".to_string(), "grandchild1_1".to_string()]
+            vec![
+                "root".to_string(),
+                "child1".to_string(),
+                "grandchild1_1".to_string()
+            ]
         );
 
         // update status of active grandchild
@@ -941,7 +973,11 @@ mod tests {
         let statuses = root.statuses();
         assert_eq!(
             statuses,
-            vec!["root".to_string(), "child1".to_string(), "updated grandchild1_1".to_string()]
+            vec![
+                "root".to_string(),
+                "child1".to_string(),
+                "updated grandchild1_1".to_string()
+            ]
         );
 
         // update status of other branch's grandchild
@@ -949,7 +985,11 @@ mod tests {
         let statuses = root.statuses();
         assert_eq!(
             statuses,
-            vec!["root".to_string(), "child1".to_string(), "updated grandchild1_1".to_string()]
+            vec![
+                "root".to_string(),
+                "child1".to_string(),
+                "updated grandchild1_1".to_string()
+            ]
         );
 
         // update status of other branch's child
@@ -957,7 +997,11 @@ mod tests {
         let statuses = root.statuses();
         assert_eq!(
             statuses,
-            vec!["root".to_string(), "child1".to_string(), "updated grandchild1_1".to_string()]
+            vec![
+                "root".to_string(),
+                "child1".to_string(),
+                "updated grandchild1_1".to_string()
+            ]
         );
     }
 
@@ -972,26 +1016,24 @@ mod tests {
         let statuses = root.statuses();
         assert_eq!(
             statuses,
-            vec!["root".to_string(), "child1".to_string(), "grandchild1".to_string()]
+            vec![
+                "root".to_string(),
+                "child1".to_string(),
+                "grandchild1".to_string()
+            ]
         );
 
         // update grandchild status and complete it
         grandchild1.update_status("completed grandchild".to_string());
         grandchild1.complete();
         let statuses = root.statuses();
-        assert_eq!(
-            statuses,
-            vec!["root".to_string(), "child1".to_string()]
-        );
+        assert_eq!(statuses, vec!["root".to_string(), "child1".to_string()]);
 
         // update child status and complete it
         child1.update_status("completed child1".to_string());
         child1.complete();
         let statuses = root.statuses();
-        assert_eq!(
-            statuses,
-            vec!["root".to_string(), "child2".to_string()]
-        );
+        assert_eq!(statuses, vec!["root".to_string(), "child2".to_string()]);
 
         // update remaining child status
         child2.update_status("updated child2".to_string());

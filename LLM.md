@@ -205,10 +205,28 @@ let token = ProgressToken::new("task");
 let mut updates = token.subscribe();
 
 // stream interface
-while let Some(update) = updates.next().await {
+while let Some(Ok(update)) = updates.next().await {
     println!("progress: {:?}", update.progress);
     println!("status: {}", update.status());
     println!("cancelled: {}", update.is_cancelled);
+}
+
+// handle errors
+while let Some(result) = updates.next().await {
+    match result {
+        Ok(update) => {
+            println!("progress: {:?}", update.progress);
+            println!("status: {}", update.status());
+            println!("cancelled: {}", update.is_cancelled);
+        }
+        Err(ProgressError::Lagged) => {
+            println!("some updates were missed");
+        }
+        Err(ProgressError::Cancelled) => {
+            println!("token was cancelled");
+            break;
+        }
+    }
 }
 
 // single update
