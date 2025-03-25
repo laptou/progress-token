@@ -14,6 +14,7 @@ A Rust library for hierarchical progress tracking with support for cancellation,
 - 📊 **Progress States**: Support for both determinate (0.0-1.0) and indeterminate progress
 - 🔄 **Multiple Subscribers**: Allow multiple parts of your application to monitor progress
 - 🧮 **Automatic Aggregation**: Progress automatically calculated from weighted child tasks
+- 🔒 **Completion Guards**: RAII-style guards to automatically complete tokens when dropped
 
 ## Installation
 
@@ -47,6 +48,10 @@ async fn main() {
     
     cleanup.progress(1.0);  // Root progress becomes 0.65 (0.35 + 1.0 * 0.3)
     cleanup.status("Cleanup complete");
+
+    // Complete tokens when done - no further updates will be processed
+    process.complete();
+    cleanup.complete();
 }
 ```
 
@@ -61,8 +66,32 @@ let token = ProgressToken::new("Processing files");
 token.progress(0.25);
 token.status("Processing file 1/4");
 
-// Mark as complete when done
+// Mark as complete when done - sets progress to 1.0 and prevents further updates
 token.complete();
+
+// These updates will be ignored since the token is completed
+token.progress(0.5);
+token.status("This won't be shown");
+```
+
+### Automatic Completion with Guards
+
+```rust
+let token = ProgressToken::new("Processing files");
+
+{
+    let _guard = token.complete_guard(); // Token will be completed when guard is dropped
+    token.progress(0.5);
+    token.status("Working...");
+} // Token is automatically completed here
+
+// Or prevent completion by forgetting the guard
+let token = ProgressToken::new("Another task");
+{
+    let guard = token.complete_guard();
+    token.progress(0.25);
+    guard.forget(); // Token won't be completed when guard is dropped
+}
 ```
 
 ### Status Updates
@@ -112,8 +141,12 @@ if error_condition {
     token.cancel(); // Cancels this token and all children
 }
 
-// In another part
-if token.is_cancelled() {
+// These updates will be ignored since the token is cancelled
+token.progress(0.5);
+token.status("This won't be shown");
+
+// Check cancellation state
+if token.cancel_token.is_cancelled() {
     return;
 }
 ```
@@ -123,8 +156,11 @@ if token.is_cancelled() {
 - Progress values are automatically clamped to the range 0.0-1.0
 - Child task weights should sum to 1.0 for accurate progress calculation
 - Status updates and progress changes are broadcast to all subscribers
-- Completed or cancelled tokens ignore further progress/status updates
+- Once a token is completed or cancelled, all further updates are ignored
 - The broadcast channel has a reasonable buffer size to prevent lagging
+- Completion and cancellation are permanent states - they cannot be undone
+- When a token is cancelled, all its children are also cancelled
+- When a token is completed, its progress is set to 1.0 and no further updates are allowed
 
 ## License
 

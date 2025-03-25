@@ -1,10 +1,10 @@
-//! A hierarchical progress tracking library that allows monitoring and reporting progress 
+//! A hierarchical progress tracking library that allows monitoring and reporting progress
 //! of long-running tasks with support for cancellation, status updates, and nested operations.
 //!
 //! # Overview
-//! 
+//!
 //! This library provides a [`ProgressToken`] type that combines progress tracking, status updates,
-//! and cancellation into a single unified interface. Unlike a basic [`CancellationToken`], 
+//! and cancellation into a single unified interface. Unlike a basic [`CancellationToken`],
 //! `ProgressToken` supports:
 //!
 //! - Hierarchical progress tracking with weighted child operations
@@ -32,10 +32,13 @@
 //!     // Subscribe to updates
 //!     let mut updates = token.subscribe();
 //!     while let Some(update) = updates.next().await {
-//!         println!("Progress: {:?}, Status: {}", 
-//!             update.progress, 
+//!         println!("Progress: {:?}, Status: {}",
+//!             update.progress,
 //!             update.status());
 //!     }
+//!
+//!     // Mark as complete when done - no further updates will be processed
+//!     token.complete();
 //! }
 //! ```
 //!
@@ -55,6 +58,10 @@
 //!     // Child progress is automatically weighted and propagated
 //!     process.progress(0.5);  // Root progress becomes 0.35 (0.5 * 0.7)
 //!     cleanup.progress(1.0);  // Root progress becomes 0.65 (0.35 + 1.0 * 0.3)
+//!     
+//!     // Complete each task when done
+//!     process.complete();  // Sets progress to 1.0 and prevents further updates
+//!     cleanup.complete();  // Sets progress to 1.0 and prevents further updates
 //! }
 //! ```
 //!
@@ -78,9 +85,13 @@
 //!     let statuses = root.statuses();
 //!     assert_eq!(statuses, vec![
 //!         "Backup",
-//!         "Compressing files", 
+//!         "Compressing files",
 //!         "Compressing images/photo1.jpg"
 //!     ]);
+//!
+//!     // Once cancelled or completed, status updates are ignored
+//!     compress.complete();
+//!     compress.status("This update will be ignored");
 //! }
 //! ```
 //!
@@ -105,18 +116,39 @@
 //! - Progress values are automatically clamped to the range 0.0-1.0
 //! - Child task weights should sum to 1.0 for accurate progress calculation
 //! - Status updates and progress changes are broadcast to all subscribers
-//! - Completed or cancelled tokens ignore further progress/status updates
+//! - Once a token is completed or cancelled, all further updates are ignored
 //! - The broadcast channel has a reasonable buffer size to prevent lagging
+//! - Completion and cancellation are permanent states - they cannot be undone
+//! - When a token is cancelled, all its children are also cancelled
+//! - When a token is completed, its progress is set to 1.0 and no further updates are allowed
 
 use futures::{Stream, ready};
 use pin_project_lite::pin_project;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use tokio::sync::broadcast;
 use tokio_stream::wrappers::BroadcastStream;
 use tokio_util::sync::{CancellationToken, WaitForCancellationFuture};
+
+/// A guard that automatically marks a [`ProgressToken`] as complete when dropped
+#[must_use = "if unused, the progress token will be completed immediately"]
+pub struct CompleteGuard<'a, S: Clone + Send + 'static> {
+    token: &'a ProgressToken<S>,
+}
+
+impl<'a, S: Clone + Send + 'static> CompleteGuard<'a, S> {
+    /// Forgets the guard without completing the progress token
+    pub fn forget(self) {
+        std::mem::forget(self);
+    }
+}
+
+impl<'a, S: Clone + Send + 'static> Drop for CompleteGuard<'a, S> {
+    fn drop(&mut self) {
+        self.token.complete();
+    }
+}
 
 /// Represents either a determinate progress value or indeterminate state
 #[derive(Debug, Clone, Copy)]
@@ -322,14 +354,12 @@ impl<S: Clone + Send> ProgressNode<S> {
 #[derive(Clone)]
 pub struct ProgressToken<S> {
     node: Arc<ProgressNode<S>>,
-    is_active: Arc<AtomicBool>,
     cancel_token: CancellationToken,
 }
 
 impl<S: std::fmt::Debug> std::fmt::Debug for ProgressToken<S> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ProgressToken")
-            .field("is_active", &self.is_active.load(Ordering::Relaxed))
             .field("is_cancelled", &self.cancel_token.is_cancelled())
             .finish()
     }
@@ -342,7 +372,6 @@ impl<S: Clone + Send + 'static> ProgressToken<S> {
 
         Self {
             node,
-            is_active: Arc::new(AtomicBool::new(true)),
             cancel_token: CancellationToken::new(),
         }
     }
@@ -353,37 +382,43 @@ impl<S: Clone + Send + 'static> ProgressToken<S> {
 
         Self {
             node,
-            is_active: Arc::new(AtomicBool::new(true)),
             cancel_token: self.cancel_token.child_token(),
         }
     }
 
     /// Update the progress of this token
     pub fn progress(&self, progress: f64) {
-        if !self.is_active.load(Ordering::Relaxed) || self.cancel_token.is_cancelled() {
+        if self.cancel_token.is_cancelled() {
             return;
         }
 
-        // // Rate-limit updates to avoid too many notifications
-        // let now = Instant::now();
-        // let count = self.update_count.fetch_add(1, Ordering::Relaxed);
+        let is_completed = {
+            let inner = self.node.inner.lock().unwrap();
+            inner.is_completed
+        };
 
-        // if now.duration_since(self.last_update) > Duration::from_millis(100) || count % 10 == 0 {
+        if is_completed {
+            return;
+        }
+
         let mut inner = self.node.inner.lock().unwrap();
         inner.progress = Progress::Determinate(progress.max(0.0).min(1.0));
         drop(inner);
 
         ProgressNode::notify_subscribers(&self.node, false);
-        // }
     }
 
     /// Set the progress state to indeterminate
     pub fn indeterminate(&self) {
-        if !self.is_active.load(Ordering::Relaxed) || self.cancel_token.is_cancelled() {
+        if self.cancel_token.is_cancelled() {
             return;
         }
 
         let mut inner = self.node.inner.lock().unwrap();
+        if inner.is_completed {
+            return;
+        }
+
         inner.progress = Progress::Indeterminate;
         drop(inner);
 
@@ -392,11 +427,15 @@ impl<S: Clone + Send + 'static> ProgressToken<S> {
 
     /// Update the status message
     pub fn status(&self, status: impl Into<S>) {
-        if !self.is_active.load(Ordering::Relaxed) || self.cancel_token.is_cancelled() {
+        if self.cancel_token.is_cancelled() {
             return;
         }
 
         let mut inner = self.node.inner.lock().unwrap();
+        if inner.is_completed {
+            return;
+        }
+
         inner.status = status.into();
         drop(inner);
 
@@ -405,8 +444,12 @@ impl<S: Clone + Send + 'static> ProgressToken<S> {
 
     /// Mark the task as complete
     pub fn complete(&self) {
-        if self.is_active.swap(false, Ordering::Relaxed) {
-            let mut inner = self.node.inner.lock().unwrap();
+        if self.cancel_token.is_cancelled() {
+            return;
+        }
+
+        let mut inner = self.node.inner.lock().unwrap();
+        if !inner.is_completed {
             inner.is_completed = true;
             inner.progress = Progress::Determinate(1.0);
             drop(inner);
@@ -417,16 +460,10 @@ impl<S: Clone + Send + 'static> ProgressToken<S> {
 
     /// Cancel this task and all its children
     pub fn cancel(&self) {
-        if self.is_active.swap(false, Ordering::Relaxed) {
+        if !self.cancel_token.is_cancelled() {
             self.cancel_token.cancel();
-
             ProgressNode::notify_subscribers(&self.node, true);
         }
-    }
-
-    /// Check if this token has been cancelled
-    pub fn is_cancelled(&self) -> bool {
-        self.cancel_token.is_cancelled()
     }
 
     /// Get the current progress state asynchronously
@@ -475,6 +512,11 @@ impl<S: Clone + Send + 'static> ProgressToken<S> {
             rx: BroadcastStream::new(rx),
         }
     }
+
+    /// Creates a guard that will automatically mark this token as complete when dropped
+    pub fn complete_guard(&self) -> CompleteGuard<'_, S> {
+        CompleteGuard { token: self }
+    }
 }
 
 pin_project! {
@@ -493,7 +535,7 @@ impl<'a, S: Clone + Send + 'static> Future for WaitForUpdateFuture<'a, S> {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let mut this = self.project();
-        if this.token.is_cancelled() {
+        if this.token.cancel_token.is_cancelled() {
             return Poll::Ready(None);
         }
 
@@ -635,9 +677,9 @@ mod tests {
         // cancel root
         root.cancel();
 
-        assert!(root.is_cancelled());
-        assert!(child1.is_cancelled());
-        assert!(child2.is_cancelled());
+        assert!(root.cancel_token.is_cancelled());
+        assert!(child1.cancel_token.is_cancelled());
+        assert!(child2.cancel_token.is_cancelled());
 
         // updates should not be processed after cancellation
         child1.progress(0.5);
@@ -645,19 +687,32 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_completion() {
+    async fn test_complete_guard() {
         let token: ProgressToken<String> = ProgressToken::new("test".to_string());
-        token.complete();
+        
+        {
+            let _guard = token.complete_guard();
+            token.progress(0.5);
+            assert!(matches!(token.state(), Progress::Determinate(p) if (p - 0.5).abs() < f64::EPSILON));
+        } // guard is dropped here, token should be completed
 
-        assert!(
-            matches!(token.state(), Progress::Determinate(p) if (p - 1.0).abs() < f64::EPSILON)
-        );
-
-        // updates after completion should not be processed
+        // token should be completed and at progress 1.0
+        assert!(matches!(token.state(), Progress::Determinate(p) if (p - 1.0).abs() < f64::EPSILON));
+        
+        // updates after completion should be ignored
         token.progress(0.5);
-        assert!(
-            matches!(token.state(), Progress::Determinate(p) if (p - 1.0).abs() < f64::EPSILON)
-        );
+        assert!(matches!(token.state(), Progress::Determinate(p) if (p - 1.0).abs() < f64::EPSILON));
+
+        // test forget
+        let token: ProgressToken<String> = ProgressToken::new("test2".to_string());
+        {
+            let guard = token.complete_guard();
+            token.progress(0.5);
+            guard.forget(); // prevent completion
+        }
+        
+        // token should still be at 0.5 since guard was forgotten
+        assert!(matches!(token.state(), Progress::Determinate(p) if (p - 0.5).abs() < f64::EPSILON));
     }
 
     #[tokio::test]

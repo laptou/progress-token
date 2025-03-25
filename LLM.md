@@ -12,16 +12,146 @@ this guide provides a comprehensive introduction and reference for using the pro
 - automatic aggregation of progress from nested child tasks
 - multiple subscribers via a broadcast channel (buffer size of 16)
 - integration with tokio for asynchronous operations
+- RAII-style completion guards
 
 ---
 
-## installation
+## method signatures
 
-to use this crate, add the following to your `Cargo.toml`:
+### ProgressToken<S>
 
-```toml
-[dependencies]
-progress-token = "0.1.0"
+core type that represents a progress tracking token. the type parameter `S` represents the type of status messages (usually `String`).
+
+```rust
+impl<S: Clone + Send + 'static> ProgressToken<S> {
+    // creation
+    pub fn new(status: impl Into<S>) -> Self
+    pub fn child(&self, weight: f64, status: impl Into<S>) -> Self
+
+    // progress updates
+    pub fn progress(&self, progress: f64)  // value is clamped to 0.0-1.0
+    pub fn indeterminate(&self)
+    pub fn status(&self, status: impl Into<S>)
+    
+    // completion and cancellation
+    pub fn complete(&self)  // sets progress to 1.0, prevents further updates
+    pub fn cancel(&self)    // cancels this and all child tokens
+    pub fn complete_guard(&self) -> CompleteGuard<'_, S>  // RAII completion
+    pub fn cancelled(&self) -> WaitForCancellationFuture
+    
+    // state inspection
+    pub fn state(&self) -> Progress
+    pub fn statuses(&self) -> Vec<S>
+    
+    // subscription
+    pub fn subscribe(&self) -> ProgressStream<'_, S>
+    pub async fn updated(&self) -> Result<ProgressUpdate<S>, ProgressError>
+}
+```
+
+### CompleteGuard<'a, S>
+
+RAII guard that completes a token when dropped.
+
+```rust
+impl<'a, S: Clone + Send + 'static> CompleteGuard<'a, S> {
+    pub fn forget(self)  // prevents completion when dropped
+}
+```
+
+### Progress
+
+represents either a determinate progress value or indeterminate state.
+
+```rust
+#[derive(Debug, Clone, Copy)]
+pub enum Progress {
+    Determinate(f64),  // value between 0.0 and 1.0
+    Indeterminate,
+}
+
+impl Progress {
+    pub fn as_f64(&self) -> Option<f64>
+}
+```
+
+### ProgressUpdate<S>
+
+data for a progress update event.
+
+```rust
+#[derive(Debug, Clone)]
+pub struct ProgressUpdate<S> {
+    pub progress: Progress,
+    pub statuses: Vec<S>,
+    pub is_cancelled: bool,
+}
+
+impl<S> ProgressUpdate<S> {
+    pub fn status(&self) -> &S  // returns most specific (last) status
+}
+```
+
+### ProgressError
+
+error type for progress update operations.
+
+```rust
+#[derive(Debug, Clone, Copy)]
+pub enum ProgressError {
+    Lagged,     // updates were missed due to slow consumption
+    Cancelled,  // token was cancelled
+}
+```
+
+---
+
+## completion and cancellation behavior
+
+both completion and cancellation are permanent states that prevent any further updates to a token:
+
+```rust
+let token = ProgressToken::new("task");
+
+// after completion:
+token.complete();
+token.progress(0.5);     // ignored
+token.status("update");  // ignored
+token.indeterminate();   // ignored
+
+// after cancellation:
+token.cancel();
+token.progress(0.5);     // ignored
+token.status("update");  // ignored
+token.indeterminate();   // ignored
+```
+
+key points:
+- completion sets progress to 1.0 permanently
+- cancellation propagates to all child tokens
+- neither state can be reversed
+- both states prevent all further updates
+- subscribers are notified of both states
+
+### using completion guards
+
+completion guards provide RAII-style completion:
+
+```rust
+let token = ProgressToken::new("task");
+
+{
+    let _guard = token.complete_guard();
+    token.progress(0.5);
+    // guard drop -> token.complete()
+}
+
+// prevent completion:
+{
+    let guard = token.complete_guard();
+    token.progress(0.5);
+    guard.forget();  // completion won't happen
+}
 ```
 
 ---
@@ -30,21 +160,16 @@ progress-token = "0.1.0"
 
 ### creating a root token
 
-the primary entry point is the `ProgressToken` type. create a new root token as follows:
-
 ```rust
 use progress_token::ProgressToken;
 
 #[tokio::main]
 async fn main() {
-    // create a root token with an initial status
     let token = ProgressToken::new("initial task");
     
-    // update token progress and status
     token.progress(0.25);
-    token.status("started processing");
+    token.status("processing");
 
-    // subscribe to updates
     let mut updates = token.subscribe();
     tokio::spawn(async move {
         while let Some(update) = updates.next().await {
@@ -52,253 +177,81 @@ async fn main() {
         }
     });
     
-    // further progress updates
-    token.progress(0.5);
-    token.status("mid task processing");
-    
-    // mark completion
-    token.complete();
+    token.complete();  // prevents further updates
 }
 ```
-
----
 
 ### creating child tokens
 
-root tokens can spawn child tokens to reflect subtasks. the child tokens contribute to the overall progress via weighted averages.
-
 ```rust
-use progress_token::ProgressToken;
+let root = ProgressToken::new("main task");
+let process = root.child(0.7, "processing");  // 70% weight
+let cleanup = root.child(0.3, "cleanup");     // 30% weight
 
-#[tokio::main]
-async fn main() {
-    // create a root token
-    let root = ProgressToken::new("main task");
-    
-    // create child tokens with specified weights
-    let process = root.child(0.7, "processing");
-    let cleanup = root.child(0.3, "cleanup");
-    
-    // update progress in child tokens
-    process.progress(0.5); // contributes 0.35 (0.7 * 0.5)
-    cleanup.progress(1.0); // contributes 0.30, overall progress becomes 0.65
+process.progress(0.5);  // root progress = 0.35 (0.7 * 0.5)
+cleanup.progress(1.0);  // root progress = 0.65 (0.35 + 0.3 * 1.0)
 
-    // update status at different levels
-    process.status("processing file 1 of 10");
-    cleanup.status("cleanup in progress");
-
-    // aggregate statuses from root downwards
-    let statuses = root.statuses();
-    println!("status hierarchy: {:?}", statuses);
-}
+process.complete();  // sets process progress to 1.0
+cleanup.complete();  // sets cleanup progress to 1.0
 ```
 
----
-
-### progress clamping and indeterminate state
-
-- progress values are automatically clamped between 0.0 and 1.0.
-- to set an indeterminate state (when exact progress is unknown), use the `indeterminate` method:
+### handling updates
 
 ```rust
-use progress_token::ProgressToken;
+let token = ProgressToken::new("task");
+let mut updates = token.subscribe();
 
-fn set_indeterminate(token: &ProgressToken<String>) {
-    token.indeterminate();
+// stream interface
+while let Some(update) = updates.next().await {
+    println!("progress: {:?}", update.progress);
+    println!("status: {}", update.status());
+    println!("cancelled: {}", update.is_cancelled);
+}
+
+// single update
+match token.updated().await {
+    Ok(update) => println!("progress: {:?}", update.progress),
+    Err(ProgressError::Cancelled) => println!("cancelled"),
+    Err(ProgressError::Lagged) => println!("updates missed"),
 }
 ```
-
----
-
-### cancellation and completion
-
-**cancellation:**
-
-- cancel a token to prevent any further progress or status updates.
-- cancellation propagates to all child tokens.
-
-```rust
-use progress_token::ProgressToken;
-
-fn cancel_task(token: &ProgressToken<String>) {
-    token.cancel();
-    // subsequent updates will be ignored
-}
-```
-
-**completion:**
-
-- mark a token as complete when its task is finished. this sets progress to 1.0.
-
-```rust
-use progress_token::ProgressToken;
-
-fn complete_task(token: &ProgressToken<String>) {
-    token.complete();
-}
-```
-
----
-
-### subscribing to progress updates
-
-use the `subscribe` method to receive a stream of `ProgressUpdate` events. each update contains:
-
-- **progress:** a `Progress` enum (either `Determinate(f64)` or `Indeterminate`)
-- **statuses:** a vector representing the hierarchy of status messages, from the root to the deepest active child
-- **is_cancelled:** a boolean indicating if the token has been cancelled
-
-```rust
-use progress_token::ProgressToken;
-use futures::StreamExt;
-
-#[tokio::main]
-async fn main() {
-    let token = ProgressToken::new("long op");
-    let mut sub = token.subscribe();
-
-    // handle updates in an asynchronous task
-    tokio::spawn(async move {
-        while let Some(update) = sub.next().await {
-            println!("progress: {:?}, status hierarchy: {:?}", update.progress, update.statuses);
-        }
-    });
-
-    token.progress(0.3);
-    token.status("30% done");
-}
-```
-
----
-
-### asynchronous update handling
-
-alternatively, use the `updated` method to await a single update. note that if the token is cancelled, it returns an error:
-
-```rust
-use progress_token::{ProgressToken, ProgressError};
-
-#[tokio::main]
-async fn main() {
-    let token = ProgressToken::new("async update");
-    
-    match token.updated().await {
-        Ok(update) => {
-            println!("received update: {:?}, status: {:?}", update.progress, update.status());
-        },
-        Err(ProgressError::Cancelled) => {
-            println!("token was cancelled");
-        },
-        Err(ProgressError::Lagged) => {
-            println!("updates lagged");
-        }
-    }
-}
-```
-
----
-
-## deep dive: internal mechanics
-
-### progress aggregation
-
-- the root token calculates overall progress as a weighted average of its child tokens' progress.
-- if any child is indeterminate, the overall progress becomes indeterminate.
-- each child token is created with a weight; ensure weights sum to roughly 1.0 for accurate results.
-
-### status hierarchy
-
-- every token holds a status message that represents its current operation.
-- calling `statuses` on a token returns a vector of status messages beginning at the root token and ending at the deepest active child.
-
-### subscription mechanism
-
-- updates are sent via a tokio broadcast channel with a limited buffer (16 slots).
-- if updates are produced too rapidly, lagging may occur, resulting in `ProgressError::Lagged`.
-
-### cancellation mechanism
-
-- cancellation is implemented using tokio's `CancellationToken`.
-- when a token is cancelled, it prevents further progress and status updates, and this state propagates to all child tokens.
 
 ---
 
 ## best practices
 
-- always check `is_cancelled` before engaging in resource-intensive work.
-- share tokens safely with `Arc<ProgressToken<S>>` when working in multithreaded contexts.
-- ensure child tokens have weights that add up to approximately 1.0 for proper progress calculation.
-- handle potential `Lagged` errors when subscribing to updates.
-- update progress and status frequently but consider rate limiting if necessary.
+- always check cancellation before expensive operations
+- use completion guards for RAII-style completion
+- ensure child weights sum to approximately 1.0
+- handle both completion and cancellation states
+- consider rate limiting frequent updates
+- drop completion guards in reverse order of creation
+- use `forget()` sparingly and only when necessary
 
 ---
 
-## advanced examples
+## error handling
 
-### nested hierarchical progress
-
-this example demonstrates a multi-level progress tree with nested tokens:
+common error cases:
 
 ```rust
-use progress_token::ProgressToken;
-use futures::StreamExt;
-
-#[tokio::main]
-async fn main() {
-    // create a root token for a backup operation
-    let root = ProgressToken::new("backup task");
-    
-    // create child tokens with weights
-    let compress = root.child(0.8, "compress files");
-    let upload = root.child(0.2, "upload files");
-    
-    // update child token progress
-    compress.progress(0.75); // weighted to 0.6 overall
-    upload.progress(1.0);      // weighted to 0.2 overall
-    
-    // update status messages
-    compress.status("compressing images");
-    upload.status("upload in progress");
-
-    // subscribe and display updates
-    let mut sub = root.subscribe();
-    tokio::spawn(async move {
-        while let Some(update) = sub.next().await {
-            println!("overall progress: {:?}, status hierarchy: {:?}", update.progress, update.statuses);
-        }
-    });
-    
-    // mark tokens complete
-    compress.complete();
-    upload.complete();
-    root.complete();
-}
-```
-
-### handling updates concurrently
-
-this example shows multiple tasks updating the same token concurrently:
-
-```rust
-use progress_token::ProgressToken;
-use tokio::time::{sleep, Duration};
-
-#[tokio::main]
-async fn main() {
-    let token = ProgressToken::new("concurrent op");
-    
-    // spawn several tasks to update progress concurrently
-    for i in 0..10 {
-        let t = token.clone();
-        tokio::spawn(async move {
-            sleep(Duration::from_millis(i * 10)).await;
-            t.progress(i as f64 / 10.0);
-        });
+// handle missed updates
+match token.updated().await {
+    Err(ProgressError::Lagged) => {
+        // some updates were missed, but can continue
     }
-    
-    // wait, then check final progress
-    sleep(Duration::from_secs(1)).await;
-    println!("final progress: {:?}", token.state());
+    Err(ProgressError::Cancelled) => {
+        // token was cancelled, stop processing
+        return;
+    }
+    Ok(update) => {
+        // process update
+    }
+}
+
+// check cancellation before expensive work
+if token.cancel_token.is_cancelled() {
+    return;
 }
 ```
 
@@ -306,6 +259,8 @@ async fn main() {
 
 ## summary
 
-this guide provided an exhaustive overview of the progress-token crate. by leveraging its hierarchical progress tracking, cancellation features, and subscription mechanism, you can seamlessly incorporate detailed progress reporting into your asynchronous rust applications. use the examples and best practices above to integrate these features in a robust and error-free manner.
+this guide provided a comprehensive reference for the progress-token crate, including all method signatures and detailed behavior descriptions. use the examples and signatures above to implement robust progress tracking in your async rust applications.
+
+remember that completion and cancellation are permanent states that prevent further updates, and consider using completion guards for automatic cleanup.
 
 happy coding! 
