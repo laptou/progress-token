@@ -644,10 +644,10 @@ mod tests {
         let token: ProgressToken<String> = ProgressToken::new("test".to_string());
         let mut subscription = token.subscribe();
 
-        // initial update
-        let update = subscription.next().await.unwrap();
-        assert_eq!(update.status(), &"test".to_string());
-        assert!(matches!(update.progress, Progress::Determinate(p) if p.abs() < f64::EPSILON));
+        // // initial update
+        // let update = subscription.next().await.unwrap();
+        // assert_eq!(update.status(), &"test".to_string());
+        // assert!(matches!(update.progress, Progress::Determinate(p) if p.abs() < f64::EPSILON));
 
         // progress update
         token.update_progress(0.5);
@@ -663,10 +663,6 @@ mod tests {
         let mut sub1 = token.subscribe();
         let mut sub2 = token.subscribe();
 
-        // Skip initial updates
-        sub1.next().await.unwrap();
-        sub2.next().await.unwrap();
-
         // both subscribers should receive updates
         token.update_progress(0.5);
 
@@ -679,6 +675,21 @@ mod tests {
         );
         assert!(
             matches!(update2.progress, Progress::Determinate(p) if (p - 0.5).abs() < f64::EPSILON),
+            "{update2:?}"
+        );
+
+        // test that both subscribers receive subsequent updates
+        token.update_progress(0.75);
+
+        let update1 = sub1.next().await.unwrap();
+        let update2 = sub2.next().await.unwrap();
+
+        assert!(
+            matches!(update1.progress, Progress::Determinate(p) if (p - 0.75).abs() < f64::EPSILON),
+            "{update1:?}"
+        );
+        assert!(
+            matches!(update2.progress, Progress::Determinate(p) if (p - 0.75).abs() < f64::EPSILON),
             "{update2:?}"
         );
     }
