@@ -29,9 +29,10 @@ impl<S: Clone + Send + 'static> ProgressToken<S> {
     pub fn child(&self, weight: f64, status: impl Into<S>) -> Self
 
     // progress updates
-    pub fn progress(&self, progress: f64)  // value is clamped to 0.0-1.0
-    pub fn indeterminate(&self)
-    pub fn status(&self, status: impl Into<S>)
+    pub fn update_progress(&self, progress: f64)  // value is clamped to 0.0-1.0
+    pub fn update_indeterminate(&self)
+    pub fn update_status(&self, status: impl Into<S>)
+    pub fn update(&self, progress: Progress, status: impl Into<S>)
     
     // completion and cancellation
     pub fn complete(&self)  // sets progress to 1.0, prevents further updates
@@ -39,6 +40,7 @@ impl<S: Clone + Send + 'static> ProgressToken<S> {
     pub fn complete_guard(&self) -> CompleteGuard<'_, S>  // RAII completion
     pub fn cancelled(&self) -> WaitForCancellationFuture
     pub fn check(&self) -> Result<(), ProgressError>  // returns Err(Cancelled) if cancelled
+    pub fn is_cancelled(&self) -> bool
     
     // state inspection
     pub fn state(&self) -> Progress
@@ -116,15 +118,15 @@ let token = ProgressToken::new("task");
 
 // after completion:
 token.complete();
-token.progress(0.5);     // ignored
-token.status("update");  // ignored
-token.indeterminate();   // ignored
+token.update_progress(0.5);     // ignored
+token.update_status("update");  // ignored
+token.update_indeterminate();   // ignored
 
 // after cancellation:
 token.cancel();
-token.progress(0.5);     // ignored
-token.status("update");  // ignored
-token.indeterminate();   // ignored
+token.update_progress(0.5);     // ignored
+token.update_status("update");  // ignored
+token.update_indeterminate();   // ignored
 ```
 
 key points:
@@ -143,14 +145,14 @@ let token = ProgressToken::new("task");
 
 {
     let _guard = token.complete_guard();
-    token.progress(0.5);
+    token.update_progress(0.5);
     // guard drop -> token.complete()
 }
 
 // prevent completion:
 {
     let guard = token.complete_guard();
-    token.progress(0.5);
+    token.update_progress(0.5);
     guard.forget();  // completion won't happen
 }
 ```
@@ -168,8 +170,8 @@ use progress_token::ProgressToken;
 async fn main() {
     let token = ProgressToken::new("initial task");
     
-    token.progress(0.25);
-    token.status("processing");
+    token.update_progress(0.25);
+    token.update_status("processing");
 
     let mut updates = token.subscribe();
     tokio::spawn(async move {
@@ -189,8 +191,8 @@ let root = ProgressToken::new("main task");
 let process = root.child(0.7, "processing");  // 70% weight
 let cleanup = root.child(0.3, "cleanup");     // 30% weight
 
-process.progress(0.5);  // root progress = 0.35 (0.7 * 0.5)
-cleanup.progress(1.0);  // root progress = 0.65 (0.35 + 0.3 * 1.0)
+process.update_progress(0.5);  // root progress = 0.35 (0.7 * 0.5)
+cleanup.update_progress(1.0);  // root progress = 0.65 (0.35 + 0.3 * 1.0)
 
 process.complete();  // sets process progress to 1.0
 cleanup.complete();  // sets cleanup progress to 1.0
@@ -260,7 +262,7 @@ async fn process_with_cancellation(token: &ProgressToken<String>) -> Result<(), 
     token.check()?;  // early return if cancelled
     
     // do work...
-    token.progress(0.5);
+    token.update_progress(0.5);
     
     token.check()?;  // check again before more work
     

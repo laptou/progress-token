@@ -42,11 +42,11 @@ async fn main() {
     let mut updates = root.subscribe();
     
     // Update progress as work is done
-    process.progress(0.5);  // Root progress becomes 0.35 (0.5 * 0.7)
-    process.status("Processing file 1/10");
+    process.update_progress(0.5);  // Root progress becomes 0.35 (0.5 * 0.7)
+    process.update_status("Processing file 1/10");
     
-    cleanup.progress(1.0);  // Root progress becomes 0.65 (0.35 + 1.0 * 0.3)
-    cleanup.status("Cleanup complete");
+    cleanup.update_progress(1.0);  // Root progress becomes 0.65 (0.35 + 1.0 * 0.3)
+    cleanup.update_status("Cleanup complete");
 
     // Complete tokens when done - no further updates will be processed
     process.complete();
@@ -62,15 +62,15 @@ async fn main() {
 let token = ProgressToken::new("Processing files");
 
 // Update progress
-token.progress(0.25);
-token.status("Processing file 1/4");
+token.update_progress(0.25);
+token.update_status("Processing file 1/4");
 
 // Mark as complete when done - sets progress to 1.0 and prevents further updates
 token.complete();
 
 // These updates will be ignored since the token is completed
-token.progress(0.5);
-token.status("This won't be shown");
+token.update_progress(0.5);
+token.update_status("This won't be shown");
 ```
 
 ### Automatic Completion with Guards
@@ -80,15 +80,15 @@ let token = ProgressToken::new("Processing files");
 
 {
     let _guard = token.complete_guard(); // Token will be completed when guard is dropped
-    token.progress(0.5);
-    token.status("Working...");
+    token.update_progress(0.5);
+    token.update_status("Working...");
 } // Token is automatically completed here
 
 // Or prevent completion by forgetting the guard
 let token = ProgressToken::new("Another task");
 {
     let guard = token.complete_guard();
-    token.progress(0.25);
+    token.update_progress(0.25);
     guard.forget(); // Token won't be completed when guard is dropped
 }
 ```
@@ -102,7 +102,7 @@ let root = ProgressToken::new("Backup");
 let compress = root.child(1.0, "Compressing files");
 
 // Update status with more specific information
-compress.status("Compressing images/photo1.jpg");
+compress.update_status("Compressing images/photo1.jpg");
 
 // Get full status hierarchy
 let statuses = root.statuses();
@@ -141,11 +141,11 @@ if error_condition {
 }
 
 // These updates will be ignored since the token is cancelled
-token.progress(0.5);
-token.status("This won't be shown");
+token.update_progress(0.5);
+token.update_status("This won't be shown");
 
 // Check cancellation state
-if token.cancel_token.is_cancelled() {
+if token.is_cancelled() {
     return;
 }
 ```
@@ -162,14 +162,14 @@ async fn process_files(token: &ProgressToken<String>) -> Result<(), ProgressErro
     token.check()?; // early return if cancelled
     
     // process files...
-    token.progress(0.5);
-    token.status("Processing files...");
+    token.update_progress(0.5);
+    token.update_status("Processing files...");
     
     // check again before more work
     token.check()?;
     
     // continue processing...
-    token.progress(1.0);
+    token.update_progress(1.0);
     token.complete();
     
     Ok(())
