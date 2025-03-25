@@ -14,7 +14,6 @@ A Rust library for hierarchical progress tracking with support for cancellation,
 - 📊 **Progress States**: Support for both determinate (0.0-1.0) and indeterminate progress
 - 🔄 **Multiple Subscribers**: Allow multiple parts of your application to monitor progress
 - 🧮 **Automatic Aggregation**: Progress automatically calculated from weighted child tasks
-- 🔒 **Completion Guards**: RAII-style guards to automatically complete tokens when dropped
 
 ## Installation
 
