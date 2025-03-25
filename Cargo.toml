@@ -1,6 +1,6 @@
 [package]
 name = "progress-token"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2024"
 authors = ["Ibiyemi Abiodun <ibiyemi@intulon.com>"]
 description = "A library for tracking progress of long-running tasks"
