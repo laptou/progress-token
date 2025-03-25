@@ -458,6 +458,15 @@ impl<S: Clone + Send + 'static> ProgressToken<S> {
         }
     }
 
+    /// Returns ProgressError::Cancelled if the token is cancelled, otherwise Ok.
+    pub fn check(&self) -> Result<(), ProgressError> {
+        if self.cancel_token.is_cancelled() {
+            Err(ProgressError::Cancelled)
+        } else {
+            Ok(())
+        }
+    }
+
     /// Cancel this task and all its children
     pub fn cancel(&self) {
         if !self.cancel_token.is_cancelled() {
