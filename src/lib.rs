@@ -8,7 +8,7 @@ use std::task::{Context, Poll};
 use thiserror::Error;
 use tokio::sync::broadcast;
 use tokio_stream::wrappers::BroadcastStream;
-use tokio_util::sync::{CancellationToken, WaitForCancellationFuture};
+use tokio_util::sync::{CancellationToken, WaitForCancellationFuture, WaitForCancellationFutureOwned};
 
 /// A guard that automatically marks a [`ProgressToken`] as complete when dropped
 #[must_use = "if unused, the progress token will be completed immediately"]
@@ -392,6 +392,10 @@ impl<S: Clone + Send + 'static> ProgressToken<S> {
         self.cancel_token.cancelled()
     }
 
+    pub fn cancelled_owned(self) -> WaitForCancellationFutureOwned {
+        self.cancel_token.cancelled_owned()
+    }
+
     pub async fn updated(&self) -> Result<ProgressUpdate<S>, ProgressError> {
         let mut rx = {
             let inner = self.node.inner.lock().unwrap();
@@ -724,6 +728,130 @@ mod tests {
         // progress should propagate to root
         assert!(
             matches!(current.state(), Progress::Determinate(p) if (p - 1.0).abs() < f64::EPSILON)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_three_level_hierarchy_progress() {
+        // create a three-level hierarchy with weighted progress
+        let root: ProgressToken<String> = ProgressToken::new("root".to_string());
+        
+        let child1 = root.child(0.7, "child1".to_string());
+        let child2 = root.child(0.3, "child2".to_string());
+        
+        let grandchild1_1 = child1.child(0.6, "grandchild1_1".to_string());
+        let grandchild1_2 = child1.child(0.4, "grandchild1_2".to_string());
+        let grandchild2_1 = child2.child(1.0, "grandchild2_1".to_string());
+
+        // update progress of grandchildren
+        grandchild1_1.update_progress(0.5); // contributes: 0.5 * 0.6 * 0.7 = 0.21 to root
+        grandchild1_2.update_progress(1.0); // contributes: 1.0 * 0.4 * 0.7 = 0.28 to root
+        grandchild2_1.update_progress(0.6); // contributes: 0.6 * 1.0 * 0.3 = 0.18 to root
+
+        // child1's progress should be: (0.5 * 0.6) + (1.0 * 0.4) = 0.7
+        assert!(
+            matches!(child1.state(), Progress::Determinate(p) if (p - 0.7).abs() < f64::EPSILON),
+            "child1 progress incorrect"
+        );
+
+        // child2's progress should be: 0.6 * 1.0 = 0.6
+        assert!(
+            matches!(child2.state(), Progress::Determinate(p) if (p - 0.6).abs() < f64::EPSILON),
+            "child2 progress incorrect"
+        );
+
+        // root's total progress should be: (0.7 * 0.7) + (0.6 * 0.3) = 0.67
+        assert!(
+            matches!(root.state(), Progress::Determinate(p) if (p - 0.67).abs() < f64::EPSILON),
+            "root progress incorrect"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_completion_hierarchy() {
+        let root: ProgressToken<String> = ProgressToken::new("root".to_string());
+        let child1 = root.child(0.6, "child1".to_string());
+        let child2 = root.child(0.4, "child2".to_string());
+        let grandchild1 = child1.child(1.0, "grandchild1".to_string());
+
+        // update and complete grandchild
+        grandchild1.update_progress(0.5);
+        grandchild1.complete();
+
+        // grandchild should be at 100%
+        assert!(
+            matches!(grandchild1.state(), Progress::Determinate(p) if (p - 1.0).abs() < f64::EPSILON),
+            "completed grandchild should be at 100%"
+        );
+
+        // child1's progress should reflect completed grandchild (100%)
+        assert!(
+            matches!(child1.state(), Progress::Determinate(p) if (p - 1.0).abs() < f64::EPSILON),
+            "child1 progress should reflect completed grandchild"
+        );
+
+        // update other child
+        child2.update_progress(0.5);
+
+        // root's progress should reflect one completed child and one at 50%
+        // (1.0 * 0.6) + (0.5 * 0.4) = 0.8
+        assert!(
+            matches!(root.state(), Progress::Determinate(p) if (p - 0.8).abs() < f64::EPSILON),
+            "root progress incorrect after child completion"
+        );
+
+        // completing a child should not auto-complete its parent
+        child2.complete();
+        assert!(
+            matches!(root.state(), Progress::Determinate(p) if (p - 1.0).abs() < f64::EPSILON),
+            "root progress should be 100% when all children complete"
+        );
+
+        // verify root is not marked as completed
+        let mut root_inner = root.node.inner.lock().unwrap();
+        assert!(!root_inner.is_completed, "root should not be auto-completed when children complete");
+    }
+
+    #[tokio::test]
+    async fn test_mixed_completion_states() {
+        let root: ProgressToken<String> = ProgressToken::new("root".to_string());
+        let child1 = root.child(0.5, "child1".to_string());
+        let child2 = root.child(0.5, "child2".to_string());
+        
+        let grandchild1_1 = child1.child(0.7, "grandchild1_1".to_string());
+        let grandchild1_2 = child1.child(0.3, "grandchild1_2".to_string());
+
+        // complete one grandchild but leave other incomplete
+        grandchild1_1.complete();
+        grandchild1_2.update_progress(0.5);
+
+        // child1's progress should be: (1.0 * 0.7) + (0.5 * 0.3) = 0.85
+        assert!(
+            matches!(child1.state(), Progress::Determinate(p) if (p - 0.85).abs() < f64::EPSILON),
+            "child1 progress incorrect with mixed completion"
+        );
+
+        // update other child
+        child2.update_progress(0.4);
+
+        // root's progress should be: (0.85 * 0.5) + (0.4 * 0.5) = 0.625
+        assert!(
+            matches!(root.state(), Progress::Determinate(p) if (p - 0.625).abs() < f64::EPSILON),
+            "root progress incorrect with mixed completion states"
+        );
+
+        // complete remaining nodes
+        grandchild1_2.complete();
+        child2.complete();
+
+        // verify final state
+        assert!(
+            matches!(root.state(), Progress::Determinate(p) if (p - 1.0).abs() < f64::EPSILON),
+            "root progress should be 100% when all descendants complete"
+        );
+        assert!(
+            matches!(child1.state(), Progress::Determinate(p) if (p - 1.0).abs() < f64::EPSILON),
+            "child1 progress should be 100% when all grandchildren complete"
         );
     }
 }
