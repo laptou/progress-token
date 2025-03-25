@@ -238,6 +238,12 @@ pub struct ProgressToken<S> {
     cancel_token: CancellationToken,
 }
 
+impl<S: Default + Clone + Send + 'static> Default for ProgressToken<S> {
+    fn default() -> Self {
+        Self::new(S::default())
+    }
+}
+
 impl<S: std::fmt::Debug> std::fmt::Debug for ProgressToken<S> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ProgressToken")
