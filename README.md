@@ -150,6 +150,49 @@ if token.cancel_token.is_cancelled() {
 }
 ```
 
+### Convenient Cancellation Checking
+
+The `check()` method and `?` operator make it easy to handle cancellation in async functions:
+
+```rust
+use progress_token::{ProgressToken, ProgressError};
+
+async fn process_files(token: &ProgressToken<String>) -> Result<(), ProgressError> {
+    // check() returns Result<(), ProgressError>
+    token.check()?; // early return if cancelled
+    
+    // process files...
+    token.progress(0.5);
+    token.status("Processing files...");
+    
+    // check again before more work
+    token.check()?;
+    
+    // continue processing...
+    token.progress(1.0);
+    token.complete();
+    
+    Ok(())
+}
+
+#[tokio::main]
+async fn main() {
+    let token = ProgressToken::new("File processing");
+    
+    // spawn cancellation task
+    let token_clone = token.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+        token_clone.cancel();
+    });
+    
+    // process files with automatic cancellation handling
+    if let Err(ProgressError::Cancelled) = process_files(&token).await {
+        println!("Operation was cancelled");
+    }
+}
+```
+
 ## Implementation Notes
 
 - Progress values are automatically clamped to the range 0.0-1.0

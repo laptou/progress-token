@@ -124,6 +124,7 @@
 
 use futures::{Stream, ready};
 use pin_project_lite::pin_project;
+use thiserror::Error;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
@@ -167,12 +168,14 @@ impl Progress {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Error)]
 pub enum ProgressError {
     /// Too many progress updates have occurred since last polled, so some of
     /// them have been dropped
+    #[error("progress updates lagged")]
     Lagged,
     /// This progress token has been cancelled, no more updates are coming
+    #[error("the operation has been cancelled")]
     Cancelled,
 }
 

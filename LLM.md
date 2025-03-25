@@ -38,6 +38,7 @@ impl<S: Clone + Send + 'static> ProgressToken<S> {
     pub fn cancel(&self)    // cancels this and all child tokens
     pub fn complete_guard(&self) -> CompleteGuard<'_, S>  // RAII completion
     pub fn cancelled(&self) -> WaitForCancellationFuture
+    pub fn check(&self) -> Result<(), ProgressError>  // returns Err(Cancelled) if cancelled
     
     // state inspection
     pub fn state(&self) -> Progress
@@ -252,6 +253,20 @@ match token.updated().await {
 // check cancellation before expensive work
 if token.cancel_token.is_cancelled() {
     return;
+}
+
+// or use the ? operator for convenient cancellation handling
+async fn process_with_cancellation(token: &ProgressToken<String>) -> Result<(), ProgressError> {
+    token.check()?;  // early return if cancelled
+    
+    // do work...
+    token.progress(0.5);
+    
+    token.check()?;  // check again before more work
+    
+    // continue processing...
+    token.complete();
+    Ok(())
 }
 ```
 
